@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  torrentio-torznab:
+    build: .
+    container_name: torrentio_torznab
+    init: true
+    ports:
+      - "5000:5000"
+    environment:
+      - OMDB_API_KEY=ba025f9b  # (opcional, para buscar por nombre)
