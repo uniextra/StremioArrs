@@ -1,8 +1,8 @@
 # StremioArrs
 
-![Docker Image Version](https://img.shields.io/docker/v/uniextra/stremioarrs?sort=semver)
+![GitHub Release](https://img.shields.io/github/v/release/uniextra/StremioArrs?include_prereleases)
 ![Docker Pulls](https://img.shields.io/docker/pulls/uniextra/stremioarrs)
-![License](https://img.shields.io/github/license/uniextra/StremioArrs)
+![License](https://img.shields.io/badge/License-MIT-blue.svg)
 
 **StremioArrs** is a lightweight Torznab proxy that bridges the gap between popular Stremio Addons and the *Arr ecosystem (Radarr, Sonarr).
 
