@@ -1,20 +1,47 @@
 import os
-import json
-import requests
-import xml.etree.ElementTree as ET
-from flask import Flask, request, Response
-from time import mktime
-from datetime import datetime, UTC
-from email.utils import format_datetime
-from typing import Optional, List, Dict, Any
-
 import re
 import logging
+from typing import Optional, List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, UTC
+from email.utils import format_datetime
+import xml.etree.ElementTree as ET
 
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
+from flask import Flask, request, Response
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
+
+# HTTP Session with Connection Pooling & Retries
+session = requests.Session()
+retries = Retry(
+    total=2,
+    backoff_factor=0.3,
+    status_forcelist=[500, 502, 503, 504],
+    raise_on_status=False
+)
+adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0"
+})
+
+PROVIDERS = {
+    "torrentio": "https://torrentio.strem.fun/stream/",
+    "peerflix": "https://addon.peerflix.mov/stream/",
+    "comet": "https://comet.elfhosted.com/",
+    "thepiratebay-plus": "https://thepiratebay-plus.strem.fun/stream/",
+}
 
 TORZNAB_CAPS = '''<?xml version="1.0" encoding="UTF-8"?>
 <caps>
@@ -35,87 +62,83 @@ TORZNAB_CAPS = '''<?xml version="1.0" encoding="UTF-8"?>
   <tags></tags>
 </caps>'''
 
-def get_streams(site: str, imdb_id: str, season: Optional[str] = None, episode: Optional[str] = None, content_type: str = "movie") -> List[Dict[str, Any]]:
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0"}
-    streams: List[Dict[str, Any]] = []
 
-    if site == "torrentio":
-        base_url = "https://torrentio.strem.fun/stream/"
-        if content_type == "movie":
-            url = f"{base_url}{content_type}/{imdb_id}.json"
-        elif content_type == "series":
-            if season is not None and episode is not None:
-                url = f"{base_url}{content_type}/{imdb_id}:{season}:{episode}.json"
-            else:
-                logger.warning("⚠️ Season and episode are required for series streams from Torrentio.")
-                return []
+def get_streams(site: str, imdb_id: str, season: Optional[str] = None, episode: Optional[str] = None, content_type: str = "movie") -> List[Dict[str, Any]]:
+    base_url = PROVIDERS.get(site)
+    if not base_url:
+        logger.error(f"❌ Unknown site: {site}")
+        return []
+
+    if content_type == "movie":
+        url = f"{base_url}{content_type}/{imdb_id}.json"
+    elif content_type == "series":
+        if season is not None and episode is not None:
+            url = f"{base_url}{content_type}/{imdb_id}:{season}:{episode}.json"
         else:
-            logger.error(f"❌ Unknown content_type for Torrentio: {content_type}")
-            return []
-    elif site == "peerflix":
-        base_url = "https://addon.peerflix.mov/stream/"
-        if content_type == "movie":
-            url = f"{base_url}{content_type}/{imdb_id}.json"
-        elif content_type == "series":
-            if season is not None and episode is not None:
-                url = f"{base_url}{content_type}/{imdb_id}:{season}:{episode}.json"
-            else:
-                logger.warning("⚠️ Season and episode are required for series streams from peerflix.")
-                return []
-        else:
-            logger.error(f"❌ Unknown content_type for peerflix: {content_type}")
-            return []        
-    elif site == "comet":
-        base_url = "https://comet.elfhosted.com/"
-        if content_type == "movie":
-            url = f"{base_url}{content_type}/{imdb_id}.json"
-        elif content_type == "series":
-            if season is not None and episode is not None:
-                url = f"{base_url}{content_type}/{imdb_id}:{season}:{episode}.json"
-            else:
-                logger.warning("⚠️ Season and episode are required for series streams from Comet.")
-                return []
-        else:
-            logger.error(f"❌ Unknown content_type for Comet: {content_type}")
-            return []
-    elif site == "thepiratebay-plus":
-        base_url = "https://thepiratebay-plus.strem.fun/stream/"
-        if content_type == "movie":
-            url = f"{base_url}{content_type}/{imdb_id}.json"
-        elif content_type == "series":
-            if season is not None and episode is not None:
-                url = f"{base_url}{content_type}/{imdb_id}:{season}:{episode}.json"
-            else:
-                logger.warning("⚠️ Season and episode are required for series streams from TPB Plus.")
-                return []
-        else:
-            logger.error(f"❌ Unknown content_type for TPB Plus: {content_type}")
+            logger.warning(f"⚠️ Season and episode are required for series streams from {site}.")
             return []
     else:
-        logger.error(f"❌ Unknown site: {site}")
+        logger.error(f"❌ Unknown content_type for {site}: {content_type}")
         return []
 
     logger.info(f"🔍 Fetching streams from: {url}")
 
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = session.get(url, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         logger.info(f"📦 Streams fetched successfully from {site}")
         if isinstance(data, dict):
-            streams = data.get("streams", [])
-            if site == "mediafusion":
-                for stream in streams:
-                    if "description" in stream:
-                        stream["title"] = stream.pop("description")
+            return data.get("streams", [])
         else:
-            logger.warning(f"⚠️ Warning: Expected dict but got {type(data)}")
+            logger.warning(f"⚠️ Warning: Expected dict from {site} but got {type(data)}")
             return []
+    except requests.RequestException as e:
+        logger.error(f"❌ Network error fetching from {site}: {e}")
+        return []
     except Exception as e:
-        logger.error(f"❌ Error fetching from {site}: {e}")
+        logger.error(f"❌ Unexpected error fetching from {site}: {e}")
         return []
 
-    return streams
+
+def deduplicate_streams(streams: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deduplicates streams by infoHash, keeping the entry with the highest seeder count."""
+    best_streams: Dict[str, tuple[int, Dict[str, Any]]] = {}
+
+    for stream in streams:
+        info_hash = stream.get("infoHash")
+        if not info_hash:
+            continue
+
+        norm_hash = info_hash.lower()
+        title = stream.get("title") or ""
+        peer_match = re.search(r'👤\s*(\d+)', title)
+        seeders = int(peer_match.group(1)) if peer_match else 0
+
+        if norm_hash not in best_streams or seeders > best_streams[norm_hash][0]:
+            best_streams[norm_hash] = (seeders, stream)
+
+    return [item[1] for item in best_streams.values()]
+
+
+def fetch_all_streams(sites: List[str], imdb_id: str, season: Optional[str] = None, episode: Optional[str] = None, content_type: str = "movie") -> List[Dict[str, Any]]:
+    """Fetches streams from multiple providers concurrently using ThreadPoolExecutor."""
+    all_streams: List[Dict[str, Any]] = []
+
+    with ThreadPoolExecutor(max_workers=len(sites)) as executor:
+        future_to_site = {
+            executor.submit(get_streams, site, imdb_id, season=season, episode=episode, content_type=content_type): site
+            for site in sites
+        }
+        for future in as_completed(future_to_site):
+            site = future_to_site[future]
+            try:
+                streams = future.result()
+                all_streams.extend(streams)
+            except Exception as e:
+                logger.error(f"❌ Unexpected error retrieving streams for {site}: {e}")
+
+    return deduplicate_streams(all_streams)
 
 
 def build_rss_response(items: List[Dict[str, Any]], category_id: str = "2000", imdb_id: Optional[str] = None) -> bytes:
@@ -133,11 +156,11 @@ def build_rss_response(items: List[Dict[str, Any]], category_id: str = "2000", i
         if not infohash:
             continue
 
-        # 🔍 Extraer tamaño y peers del título si están
+        # 🔍 Extract size and peers from title
         size_match = re.search(r'💾\s*([\d.]+)\s*(GB|MB)', title)
         peer_match = re.search(r'👤\s*(\d+)', title)
 
-        # 🧮 Convertir tamaño a bytes
+        # 🧮 Convert size to bytes
         if size_match:
             size_value = float(size_match.group(1))
             size_unit = size_match.group(2)
@@ -148,13 +171,18 @@ def build_rss_response(items: List[Dict[str, Any]], category_id: str = "2000", i
             else:
                 size_bytes = 0
         else:
-            size_bytes = int(raw_size)
+            try:
+                size_bytes = int(raw_size)
+            except (ValueError, TypeError):
+                size_bytes = 0
 
         seeders = peer_match.group(1) if peer_match else "0"
 
         el = ET.SubElement(channel, "item")
         ET.SubElement(el, "title").text = title
-        ET.SubElement(el, "guid").text = f"magnet:?xt=urn:btih:{infohash}"
+        guid = ET.SubElement(el, "guid")
+        guid.text = f"magnet:?xt=urn:btih:{infohash}"
+        guid.set("isPermaLink", "false")
         ET.SubElement(el, "link").text = f"magnet:?xt=urn:btih:{infohash}"
         ET.SubElement(el, "pubDate").text = format_datetime(datetime.now(UTC))
         ET.SubElement(el, "size").text = str(size_bytes)
@@ -176,7 +204,7 @@ def build_rss_response(items: List[Dict[str, Any]], category_id: str = "2000", i
 
     return ET.tostring(rss, encoding="utf-8", method="xml")
 
-### TEST http://192.168.1.137:5100/api?t=movie&id=tt1375666
+
 @app.route("/api")
 def torznab_api() -> Response:
     args = request.args
@@ -184,10 +212,10 @@ def torznab_api() -> Response:
     if t == "caps":
         t = "capabilities"
 
-    logger.info(f"------------------------------------------------------\n\n\n📥 Request received: {args}")
+    logger.info(f"------------------------------------------------------\n📥 Request received: {args}")
 
     if t == "capabilities":
-        logger.info(f"✅ TORZNAB_CAPS requested")
+        logger.info("✅ TORZNAB_CAPS requested")
         return Response(TORZNAB_CAPS, mimetype="application/xml")
 
     elif t in ["search", "movie-search", "movie"]:
@@ -211,7 +239,7 @@ def torznab_api() -> Response:
                 if year:
                     params["y"] = year
 
-                r = requests.get(omdb_url, params=params, timeout=10)
+                r = session.get(omdb_url, params=params, timeout=10)
                 r.raise_for_status()
                 data = r.json()
                 imdb_id = data.get("imdbID")
@@ -223,11 +251,7 @@ def torznab_api() -> Response:
                 imdb_id = None
 
         if imdb_id:
-            torrentio_streams = get_streams("torrentio", imdb_id, content_type="movie")
-            comet_streams = get_streams("comet", imdb_id, content_type="movie")
-            peerflix_streams = get_streams("peerflix", imdb_id, content_type="movie")
-            tpb_streams = get_streams("thepiratebay-plus", imdb_id, content_type="movie")
-            all_streams = torrentio_streams + peerflix_streams + comet_streams + tpb_streams
+            all_streams = fetch_all_streams(list(PROVIDERS.keys()), imdb_id, content_type="movie")
             xml = build_rss_response(all_streams, category_id=cat, imdb_id=imdb_id)
             return Response(xml, mimetype="application/rss+xml")
         else:
@@ -241,29 +265,28 @@ def torznab_api() -> Response:
         episode = args.get("ep", "1")
         cat = args.get("cat", "5000").split(",")[0]
         imdb_id = args.get("id") or args.get("imdbid")
-        imdb_id = "tt" + imdb_id if imdb_id and not imdb_id.startswith("tt") else imdb_id        
-        #/api?t=tvsearch&cat=5030,5040&extended=1&offset=0&limit=100&imdbid=tt30895499&season=1&ep=8
+        imdb_id = "tt" + imdb_id if imdb_id and not imdb_id.startswith("tt") else imdb_id
+
         logger.info(f"📺 TV Search: q={query} imdb_id={imdb_id}, season={season}, episode={episode}")
 
-
-        # if not imdb_id and query:
-        #     try:
-        #         omdb_url = f"http://www.omdbapi.com/?apikey={OMDB_API_KEY}&t={query}&type=series"
-        #         r = requests.get(omdb_url)
-        #         r.raise_for_status()
-        #         data = r.json()
-        #         imdb_id = data.get("imdbID")
-        #         if not imdb_id:
-        #             raise Exception("IMDB ID not found from OMDb")
-        #     except Exception as e:
-        #         logger.error(f"❌ OMDb error: {e}")
+        if not imdb_id and query:
+            try:
+                omdb_url = "http://www.omdbapi.com/"
+                params = {"apikey": OMDB_API_KEY, "t": query.strip(), "type": "series"}
+                r = session.get(omdb_url, params=params, timeout=10)
+                r.raise_for_status()
+                data = r.json()
+                imdb_id = data.get("imdbID")
+                if imdb_id:
+                    logger.info(f"🎬 Found series imdbID via OMDb: {imdb_id}")
+                else:
+                    logger.warning(f"⚠️ Series IMDB ID not found from OMDb for query: {query}")
+            except Exception as e:
+                logger.error(f"❌ OMDb series lookup failed: {e} query -> {query}")
+                imdb_id = None
 
         if imdb_id:
-            torrentio_streams = get_streams("torrentio", imdb_id, season=season, episode=episode, content_type="series")
-            comet_streams = get_streams("comet", imdb_id, season=season, episode=episode, content_type="series")
-            peerflix_streams = get_streams("peerflix", imdb_id, season=season, episode=episode, content_type="series")
-            tpb_streams = get_streams("thepiratebay-plus", imdb_id, season=season, episode=episode, content_type="series")
-            all_streams = torrentio_streams + comet_streams + peerflix_streams + tpb_streams
+            all_streams = fetch_all_streams(list(PROVIDERS.keys()), imdb_id, season=season, episode=episode, content_type="series")
             xml = build_rss_response(all_streams, category_id=cat, imdb_id=imdb_id)
             return Response(xml, mimetype="application/rss+xml")
         else:

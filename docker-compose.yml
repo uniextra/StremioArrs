@@ -1,11 +1,12 @@
 version: '3.8'
 
 services:
-  torrentio-torznab:
+  stremioarrs:
     build: .
-    container_name: torrentio_torznab
+    container_name: stremioarrs
     init: true
+    restart: unless-stopped
     ports:
-      - "5000:5000"
+      - "5100:5100"
     environment:
-      - OMDB_API_KEY=ba025f9b  # (opcional, para buscar por nombre)
+      - OMDB_API_KEY=${OMDB_API_KEY:-}

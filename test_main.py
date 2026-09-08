@@ -1,6 +1,6 @@
 import pytest
 import xml.etree.ElementTree as ET
-from main import get_streams, build_rss_response
+from main import get_streams, build_rss_response, deduplicate_streams
 
 # ---------------------------------------------------------
 # Unit Tests for Data Extraction (Size and Peers)
@@ -74,6 +74,18 @@ def test_build_rss_response_ignores_missing_infohash():
     xml_result = build_rss_response(items)
     parsed = parse_rss_xml(xml_result)
     assert len(parsed) == 0
+
+def test_deduplicate_streams_keeps_higher_seeders():
+    streams = [
+        {"title": "Release 1080p 👤 5 💾 2 GB", "infoHash": "HASH123"},
+        {"title": "Release 1080p 👤 50 💾 2 GB", "infoHash": "hash123"},
+        {"title": "Another Movie 👤 10 💾 1 GB", "infoHash": "HASH456"}
+    ]
+    deduped = deduplicate_streams(streams)
+    assert len(deduped) == 2
+    # Ensure the entry for hash123 kept is the one with 50 seeders
+    hash123_entry = next(s for s in deduped if s["infoHash"].lower() == "hash123")
+    assert "👤 50" in hash123_entry["title"]
 
 # ---------------------------------------------------------
 # Integration Tests for Endpoints (Torrentio, Peerflix, Comet)
