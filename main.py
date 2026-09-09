@@ -52,9 +52,11 @@ PROVIDERS = {
     "thepiratebay-plus": os.getenv("THEPIRATEBAY_PLUS_URL", "https://thepiratebay-plus.strem.fun/stream/"),
 }
 
-TORZNAB_CAPS = '''<?xml version="1.0" encoding="UTF-8"?>
+def get_torznab_caps(provider_name: str) -> str:
+    title = f"{provider_name.capitalize()} Proxy" if provider_name != "all" else "StremioArrs Proxy"
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
 <caps>
-  <server version="1.0" title="Torrentio" strapline="Torrentio Proxy" email="contact@example.com" url="http://127.0.0.1:5100" image="http://127.0.0.1:5100/logo.png" />
+  <server version="1.0" title="{title}" strapline="Stremio Addon Torznab Proxy" email="contact@example.com" url="http://127.0.0.1:5100" image="http://127.0.0.1:5100/logo.png" />
   <limits default="100" max="100" />
   <searching>
     <search available="yes" supportedParams="q" />
@@ -220,18 +222,26 @@ def build_rss_response(items: List[Dict[str, Any]], category_id: str = "2000", i
     return ET.tostring(rss, encoding="utf-8", method="xml")
 
 
+@app.route("/all/api")
 @app.route("/api")
-def torznab_api() -> Response:
+@app.route("/<provider>/api")
+def torznab_api(provider: Optional[str] = None) -> Response:
+    provider = provider.lower() if provider else "all"
+    if provider != "all" and provider not in PROVIDERS:
+        return Response("<error>Unknown provider</error>", status=404, mimetype="application/xml")
+        
+    target_sites = [provider] if provider != "all" else list(PROVIDERS.keys())
+
     args = request.args
     t = args.get("t")
     if t == "caps":
         t = "capabilities"
 
-    logger.info(f"------------------------------------------------------\n📥 Request received: {args}")
+    logger.info(f"------------------------------------------------------\n📥 Request received [{provider}]: {args}")
 
     if t == "capabilities":
-        logger.info("✅ TORZNAB_CAPS requested")
-        return Response(TORZNAB_CAPS, mimetype="application/xml")
+        logger.info(f"✅ TORZNAB_CAPS requested for {provider}")
+        return Response(get_torznab_caps(provider), mimetype="application/xml")
 
     elif t in ["search", "movie-search", "movie"]:
         imdb_id = args.get("id") or args.get("imdbid")
@@ -266,7 +276,7 @@ def torznab_api() -> Response:
                 imdb_id = None
 
         if imdb_id:
-            all_streams = fetch_all_streams(list(PROVIDERS.keys()), imdb_id, content_type="movie")
+            all_streams = fetch_all_streams(target_sites, imdb_id, content_type="movie")
             xml = build_rss_response(all_streams, category_id=cat, imdb_id=imdb_id)
             return Response(xml, mimetype="application/rss+xml")
         else:
@@ -301,7 +311,7 @@ def torznab_api() -> Response:
                 imdb_id = None
 
         if imdb_id:
-            all_streams = fetch_all_streams(list(PROVIDERS.keys()), imdb_id, season=season, episode=episode, content_type="series")
+            all_streams = fetch_all_streams(target_sites, imdb_id, season=season, episode=episode, content_type="series")
             xml = build_rss_response(all_streams, category_id=cat, imdb_id=imdb_id)
             return Response(xml, mimetype="application/rss+xml")
         else:

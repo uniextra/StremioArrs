@@ -123,3 +123,28 @@ def test_get_streams_series_integration(site):
     if len(streams) > 0:
         first_stream = streams[0]
         assert "infoHash" in first_stream, f"{site} stream is missing infoHash"
+
+# ---------------------------------------------------------
+# Flask App Routing and Caps Tests
+# ---------------------------------------------------------
+
+from main import app
+
+def test_capabilities_dynamic_title():
+    client = app.test_client()
+    
+    # Test specific provider route
+    resp = client.get("/torrentio/api?t=caps")
+    assert resp.status_code == 200
+    assert b'title="Torrentio Proxy"' in resp.data
+    
+    # Test fallback/all route
+    resp_all = client.get("/api?t=caps")
+    assert resp_all.status_code == 200
+    assert b'title="StremioArrs Proxy"' in resp_all.data
+
+def test_invalid_provider_route():
+    client = app.test_client()
+    resp = client.get("/fakeaddon/api?t=caps")
+    assert resp.status_code == 404
+    assert b'<error>Unknown provider</error>' in resp.data

@@ -66,7 +66,13 @@ Once the container is running, head over to your Radarr or Sonarr web interface:
 3. Select **Torznab** (Custom).
 4. Fill in the fields:
    - **Name**: StremioArrs (o el que prefieras)
-   - **URL**: `http://localhost:5100/api` *(O la IP local de tu NAS/Servidor si está en otra máquina, ej: `http://192.168.1.100:5100/api`)*
+   - **URL**: Puedes añadir todos los addons juntos o configurarlos como fuentes independientes (Recomendado):
+     - Todos a la vez (Modo agrupado): `http://localhost:5100/api`
+     - Solo Torrentio: `http://localhost:5100/torrentio/api`
+     - Solo Comet: `http://localhost:5100/comet/api`
+     - Solo Peerflix: `http://localhost:5100/peerflix/api`
+     - Solo ThePirateBay+: `http://localhost:5100/thepiratebay-plus/api`
+     *(Cambia `localhost` por la IP local de tu NAS/Servidor si está en otra máquina, ej: `http://192.168.1.100:5100/torrentio/api`)*
    - **API Key**: Déjalo en blanco (no se requiere).
    - **Categories**: 
      - Para Radarr: `2000, 2010` (Movies)
