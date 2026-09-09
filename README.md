@@ -57,24 +57,23 @@ docker run -d \
   uniextra/stremioarrs:latest
 ```
 
-## ⚙️ Configuring Radarr / Sonarr
+## ⚙️ Configuring Prowlarr / Radarr / Sonarr
 
-Once the container is running, head over to your Radarr or Sonarr web interface:
+Once the container is running, head over to Prowlarr, Radarr, or Sonarr:
 
-1. Go to **Settings > Indexers**.
-2. Click the `+` button to add a new Indexer.
-3. Select **Torznab** (Custom).
-4. Fill in the fields:
-   - **Name**: StremioArrs (or whatever you prefer)
-   - **URL**: You can add all addons together or configure them as independent indexers (Recommended):
-     - All at once (Aggregated mode): `http://localhost:5100/api`
-     - Only Torrentio: `http://localhost:5100/torrentio/api`
-     - Only Comet: `http://localhost:5100/comet/api`
-     - Only Peerflix: `http://localhost:5100/peerflix/api`
-     - Only ThePirateBay+: `http://localhost:5100/thepiratebay-plus/api`
+1. Go to **Settings > Indexers** (or **Indexers** in Prowlarr).
+2. Click `+` and select **Torznab (Custom / Generic Torznab)**.
+3. Fill in the fields:
+   - **Name**: StremioArrs - Torrentio (or whatever you prefer)
+   - **URL**: You can add all addons together or configure them as independent indexers:
+     - All addons (Aggregated): `http://<server-ip>:5100` (or `/api`)
+     - Only Torrentio: `http://<server-ip>:5100/torrentio` (or `/torrentio/api`)
+     - Only Comet: `http://<server-ip>:5100/comet` (or `/comet/api`)
+     - Only Peerflix: `http://<server-ip>:5100/peerflix` (or `/peerflix/api`)
+     - Only ThePirateBay+: `http://<server-ip>:5100/thepiratebay-plus` (or `/thepiratebay-plus/api`)
      
-     *(Change `localhost` to the local IP of your NAS/Server if it's on another machine, e.g., `http://192.168.1.100:5100/torrentio/api`)*
-   - **API Key**: Leave blank (not required).
+     *(Note: Prowlarr automatically appends `/api` to URLs. All variations including root, `/api`, and double `/api/api` are seamlessly handled without 404s).*
+   - **API Key**: Leave blank or put any dummy text (not required).
    - **Categories**: 
      - For Radarr: `2000, 2010` (Movies)
      - For Sonarr: `5000, 5030, 5040` (TV)

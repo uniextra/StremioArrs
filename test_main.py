@@ -133,18 +133,75 @@ from main import app
 def test_capabilities_dynamic_title():
     client = app.test_client()
     
-    # Test specific provider route
-    resp = client.get("/torrentio/api?t=caps")
-    assert resp.status_code == 200
-    assert b'title="Torrentio Proxy"' in resp.data
-    
-    # Test fallback/all route
-    resp_all = client.get("/api?t=caps")
-    assert resp_all.status_code == 200
-    assert b'title="StremioArrs Proxy"' in resp_all.data
+    # Test specific provider routes
+    for path in ["/torrentio", "/torrentio/api", "/torrentio/api/api", "/torrentio/api/"]:
+        resp = client.get(f"{path}?t=caps")
+        assert resp.status_code == 200, f"Failed for {path}"
+        assert b'title="Torrentio Proxy"' in resp.data
+
+    # Test fallback/all routes
+    for path in ["/", "/api", "/api/api", "/all", "/all/api", "/all/api/api"]:
+        resp = client.get(f"{path}?t=caps")
+        assert resp.status_code == 200, f"Failed for {path}"
+        assert b'title="StremioArrs Proxy"' in resp.data
 
 def test_invalid_provider_route():
     client = app.test_client()
     resp = client.get("/fakeaddon/api?t=caps")
     assert resp.status_code == 404
     assert b'<error>Unknown provider</error>' in resp.data
+
+def test_invalid_subpath_route():
+    client = app.test_client()
+    resp = client.get("/torrentio/invalidsubpath?t=caps")
+    assert resp.status_code == 404
+    assert b'<error>Invalid endpoint</error>' in resp.data
+
+def test_prowlarr_test_queries_return_fallback_results():
+    client = app.test_client()
+    
+    # Empty query movie search on /torrentio/api
+    resp1 = client.get("/torrentio/api?t=search")
+    assert resp1.status_code == 200
+    parsed1 = parse_rss_xml(resp1.data)
+    assert len(parsed1) > 0
+
+    # Empty query movie search on /torrentio/api/api (what Prowlarr requests)
+    resp2 = client.get("/torrentio/api/api?t=search")
+    assert resp2.status_code == 200
+    parsed2 = parse_rss_xml(resp2.data)
+    assert len(parsed2) > 0
+
+    # Empty query on /api?t=search
+    resp3 = client.get("/api?t=search")
+    assert resp3.status_code == 200
+    parsed3 = parse_rss_xml(resp3.data)
+    assert len(parsed3) > 0
+
+    # Empty query TV search on /api?t=tvsearch
+    resp4 = client.get("/api?t=tvsearch")
+    assert resp4.status_code == 200
+    parsed4 = parse_rss_xml(resp4.data)
+    assert len(parsed4) > 0
+
+def test_nonexistent_searches_return_empty_results():
+    client = app.test_client()
+
+    # Specific movie search that does not exist
+    resp = client.get("/api?t=search&q=nonexistentmovie123456")
+    assert resp.status_code == 200
+    parsed = parse_rss_xml(resp.data)
+    assert len(parsed) == 0
+
+    # Specific TV search that does not exist
+    resp_tv = client.get("/api?t=tvsearch&q=nonexistenttvshow123456")
+    assert resp_tv.status_code == 200
+    parsed_tv = parse_rss_xml(resp_tv.data)
+    assert len(parsed_tv) == 0
+
+    # Specific nonexistent IMDB ID
+    resp_imdb = client.get("/api?t=search&imdbid=tt999999999")
+    assert resp_imdb.status_code == 200
+    parsed_imdb = parse_rss_xml(resp_imdb.data)
+    assert len(parsed_imdb) == 0
+
