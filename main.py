@@ -21,12 +21,15 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
 
+REQUEST_TIMEOUT = (3.05, 5)  # (connect_timeout, read_timeout)
+
 # HTTP Session with Connection Pooling & Retries
 session = requests.Session()
 retries = Retry(
-    total=2,
-    backoff_factor=0.3,
+    total=1,
+    backoff_factor=0.2,
     status_forcelist=[500, 502, 503, 504],
+    respect_retry_after_header=False,
     raise_on_status=False
 )
 adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
@@ -36,11 +39,17 @@ session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0"
 })
 
+COMET_URL = os.getenv("COMET_URL", "https://comet.elfhosted.com/e30=/stream/")
+if not COMET_URL.endswith("/"):
+    COMET_URL += "/"
+if "/stream/" not in COMET_URL:
+    COMET_URL = COMET_URL.rstrip("/") + "/stream/"
+
 PROVIDERS = {
-    "torrentio": "https://torrentio.strem.fun/stream/",
-    "peerflix": "https://addon.peerflix.mov/stream/",
-    "comet": "https://comet.elfhosted.com/",
-    "thepiratebay-plus": "https://thepiratebay-plus.strem.fun/stream/",
+    "torrentio": os.getenv("TORRENTIO_URL", "https://torrentio.strem.fun/stream/"),
+    "peerflix": os.getenv("PEERFLIX_URL", "https://addon.peerflix.mov/stream/"),
+    "comet": COMET_URL,
+    "thepiratebay-plus": os.getenv("THEPIRATEBAY_PLUS_URL", "https://thepiratebay-plus.strem.fun/stream/"),
 }
 
 TORZNAB_CAPS = '''<?xml version="1.0" encoding="UTF-8"?>
@@ -84,12 +93,15 @@ def get_streams(site: str, imdb_id: str, season: Optional[str] = None, episode: 
     logger.info(f"🔍 Fetching streams from: {url}")
 
     try:
-        resp = session.get(url, timeout=10)
+        resp = session.get(url, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         logger.info(f"📦 Streams fetched successfully from {site}")
         if isinstance(data, dict):
-            return data.get("streams", [])
+            raw_streams = data.get("streams", [])
+            if isinstance(raw_streams, list):
+                return [s for s in raw_streams if isinstance(s, dict) and s.get("infoHash")]
+            return []
         else:
             logger.warning(f"⚠️ Warning: Expected dict from {site} but got {type(data)}")
             return []
@@ -130,13 +142,16 @@ def fetch_all_streams(sites: List[str], imdb_id: str, season: Optional[str] = No
             executor.submit(get_streams, site, imdb_id, season=season, episode=episode, content_type=content_type): site
             for site in sites
         }
-        for future in as_completed(future_to_site):
-            site = future_to_site[future]
-            try:
-                streams = future.result()
-                all_streams.extend(streams)
-            except Exception as e:
-                logger.error(f"❌ Unexpected error retrieving streams for {site}: {e}")
+        try:
+            for future in as_completed(future_to_site, timeout=12):
+                site = future_to_site[future]
+                try:
+                    streams = future.result()
+                    all_streams.extend(streams)
+                except Exception as e:
+                    logger.error(f"❌ Unexpected error retrieving streams for {site}: {e}")
+        except TimeoutError:
+            logger.warning("⚠️ Overall provider fetch timed out; returning collected streams.")
 
     return deduplicate_streams(all_streams)
 
@@ -239,7 +254,7 @@ def torznab_api() -> Response:
                 if year:
                     params["y"] = year
 
-                r = session.get(omdb_url, params=params, timeout=10)
+                r = session.get(omdb_url, params=params, timeout=REQUEST_TIMEOUT)
                 r.raise_for_status()
                 data = r.json()
                 imdb_id = data.get("imdbID")
@@ -273,7 +288,7 @@ def torznab_api() -> Response:
             try:
                 omdb_url = "http://www.omdbapi.com/"
                 params = {"apikey": OMDB_API_KEY, "t": query.strip(), "type": "series"}
-                r = session.get(omdb_url, params=params, timeout=10)
+                r = session.get(omdb_url, params=params, timeout=REQUEST_TIMEOUT)
                 r.raise_for_status()
                 data = r.json()
                 imdb_id = data.get("imdbID")
