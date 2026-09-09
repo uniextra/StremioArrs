@@ -18,6 +18,7 @@ By running this proxy, you can use Stremio's vast ecosystem of torrent streaming
   - 🏴‍☠️ The Pirate Bay Plus (TPB+)
 - **Smart Parsing**: Accurately parses sizes (`💾`) and seeders (`👤`) from the addons to ensure your quality profiles and minimum seeder limits are respected.
 - **OMDb API Integration**: Converts text-based fallback queries from Radarr/Sonarr directly into valid IMDb IDs needed by Stremio Addons.
+- **Independent Indexing**: Supports path-based routing, allowing you to configure each addon as an independent Torznab indexer (e.g., `/torrentio/api`) or aggregate them all into a single endpoint (`/api`).
 
 ## 🚀 Getting Started
 
@@ -30,7 +31,6 @@ Get one here: [http://www.omdbapi.com/apikey.aspx](http://www.omdbapi.com/apikey
 Create a `docker-compose.yml` file:
 
 ```yaml
-version: '3'
 services:
   stremioarrs:
     image: uniextra/stremioarrs:latest
@@ -65,19 +65,20 @@ Once the container is running, head over to your Radarr or Sonarr web interface:
 2. Click the `+` button to add a new Indexer.
 3. Select **Torznab** (Custom).
 4. Fill in the fields:
-   - **Name**: StremioArrs (o el que prefieras)
-   - **URL**: Puedes añadir todos los addons juntos o configurarlos como fuentes independientes (Recomendado):
-     - Todos a la vez (Modo agrupado): `http://localhost:5100/api`
-     - Solo Torrentio: `http://localhost:5100/torrentio/api`
-     - Solo Comet: `http://localhost:5100/comet/api`
-     - Solo Peerflix: `http://localhost:5100/peerflix/api`
-     - Solo ThePirateBay+: `http://localhost:5100/thepiratebay-plus/api`
-     *(Cambia `localhost` por la IP local de tu NAS/Servidor si está en otra máquina, ej: `http://192.168.1.100:5100/torrentio/api`)*
-   - **API Key**: Déjalo en blanco (no se requiere).
+   - **Name**: StremioArrs (or whatever you prefer)
+   - **URL**: You can add all addons together or configure them as independent indexers (Recommended):
+     - All at once (Aggregated mode): `http://localhost:5100/api`
+     - Only Torrentio: `http://localhost:5100/torrentio/api`
+     - Only Comet: `http://localhost:5100/comet/api`
+     - Only Peerflix: `http://localhost:5100/peerflix/api`
+     - Only ThePirateBay+: `http://localhost:5100/thepiratebay-plus/api`
+     
+     *(Change `localhost` to the local IP of your NAS/Server if it's on another machine, e.g., `http://192.168.1.100:5100/torrentio/api`)*
+   - **API Key**: Leave blank (not required).
    - **Categories**: 
-     - Para Radarr: `2000, 2010` (Movies)
-     - Para Sonarr: `5000, 5030, 5040` (TV)
-5. Haz clic en **Test** para comprobar que conecta correctamente y luego en **Save**.
+     - For Radarr: `2000, 2010` (Movies)
+     - For Sonarr: `5000, 5030, 5040` (TV)
+5. Click **Test** to verify the connection, then click **Save**.
 
 ## 🛠️ Local Development (Python)
 
