@@ -1,6 +1,20 @@
 import pytest
 import xml.etree.ElementTree as ET
-from main import get_streams, build_rss_response, deduplicate_streams
+from main import (
+    app,
+    get_streams,
+    build_rss_response,
+    deduplicate_streams,
+    clean_title_emojis,
+    parse_custom_addons,
+    load_custom_addons,
+    get_omdb_metadata,
+    PROVIDERS,
+    stream_cache,
+    omdb_cache,
+    metrics,
+    cache_lock
+)
 
 # ---------------------------------------------------------
 # Unit Tests for Data Extraction (Size and Peers)
@@ -90,7 +104,6 @@ def test_deduplicate_streams_keeps_higher_seeders():
 # ---------------------------------------------------------
 # Integration Tests for Endpoints (Torrentio, Peerflix, Comet)
 # ---------------------------------------------------------
-# Note: These tests make real HTTP requests to check if the sites are up and returning expected formats.
 
 @pytest.mark.parametrize("site", ["torrentio", "peerflix", "comet", "thepiratebay-plus"])
 def test_get_streams_movie_integration(site):
@@ -128,8 +141,6 @@ def test_get_streams_series_integration(site):
 # Flask App Routing and Caps Tests
 # ---------------------------------------------------------
 
-from main import app
-
 def test_capabilities_dynamic_title():
     client = app.test_client()
     
@@ -139,8 +150,8 @@ def test_capabilities_dynamic_title():
         assert resp.status_code == 200, f"Failed for {path}"
         assert b'title="Torrentio Proxy"' in resp.data
 
-    # Test fallback/all routes
-    for path in ["/", "/api", "/api/api", "/all", "/all/api", "/all/api/api"]:
+    # Test fallback/all routes (note: '/' is now Web Dashboard, /api is torznab)
+    for path in ["/api", "/api/api", "/all", "/all/api", "/all/api/api"]:
         resp = client.get(f"{path}?t=caps")
         assert resp.status_code == 200, f"Failed for {path}"
         assert b'title="StremioArrs Proxy"' in resp.data
@@ -205,3 +216,116 @@ def test_nonexistent_searches_return_empty_results():
     parsed_imdb = parse_rss_xml(resp_imdb.data)
     assert len(parsed_imdb) == 0
 
+# ---------------------------------------------------------
+# Web Dashboard Tests
+# ---------------------------------------------------------
+
+def test_web_dashboard_html_response():
+    client = app.test_client()
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "text/html" in resp.content_type
+    assert b"StremioArrs Dashboard" in resp.data
+    assert b"Total Requests" in resp.data
+    assert b"Active Providers" in resp.data
+    assert b"torrentio" in resp.data
+    assert b"/torrentio/api" in resp.data
+
+# ---------------------------------------------------------
+# Dynamic Addons Tests
+# ---------------------------------------------------------
+
+def test_parse_custom_addons_various_formats():
+    raw_str = "addon1=https://addon1.com/stream/,addon2=http://addon2.com,addon3=http://addon3.org/stream"
+    parsed = parse_custom_addons(raw_str)
+    assert "addon1" in parsed
+    assert parsed["addon1"] == "https://addon1.com/stream/"
+    assert "addon2" in parsed
+    assert parsed["addon2"] == "http://addon2.com/stream/"
+    assert "addon3" in parsed
+    assert parsed["addon3"] == "http://addon3.org/stream/"
+
+def test_load_custom_addons_integration():
+    custom_str = "dynatest=https://dynatest.strem.fun/stream/"
+    loaded = load_custom_addons(custom_str)
+    assert "dynatest" in loaded
+    assert "dynatest" in PROVIDERS
+    assert metrics["providers"]["dynatest"]["is_custom"] is True
+
+    # Test caps endpoint for the newly added dynamic provider
+    client = app.test_client()
+    resp = client.get("/dynatest/api?t=caps")
+    assert resp.status_code == 200
+    assert b'title="Dynatest Proxy"' in resp.data
+
+# ---------------------------------------------------------
+# In-Memory Caching Tests
+# ---------------------------------------------------------
+
+def test_stream_cache_hit():
+    key = ("torrentio", "tt_cache_test", None, None, "movie")
+    cached_data = [{"title": "Cached Movie 1080p 💾 2.0 GB 👤 50", "infoHash": "abcdef1234567890"}]
+    
+    with cache_lock:
+        stream_cache[key] = cached_data
+        initial_hits = metrics["cache_hits"]
+
+    # Request streams for the same key
+    streams = get_streams("torrentio", "tt_cache_test", content_type="movie")
+    assert len(streams) == 1
+    assert streams[0]["infoHash"] == "abcdef1234567890"
+    assert metrics["cache_hits"] == initial_hits + 1
+
+def test_omdb_cache_hit():
+    cache_key = "imdb:tt8888888"
+    mock_omdb_data = {
+        "Title": "Cached Inception",
+        "Year": "2010",
+        "imdbID": "tt8888888",
+        "Response": "True"
+    }
+
+    with cache_lock:
+        omdb_cache[cache_key] = mock_omdb_data
+        initial_hits = metrics["cache_hits"]
+
+    res = get_omdb_metadata(imdb_id="tt8888888")
+    assert res is not None
+    assert res["Title"] == "Cached Inception"
+    assert metrics["cache_hits"] == initial_hits + 1
+
+# ---------------------------------------------------------
+# Advanced Quality Parsing & Title Prepending Tests
+# ---------------------------------------------------------
+
+def test_clean_title_emojis():
+    raw = "[RD+] 1080p BluRay 👤 45 ⚙️ Torrentio \n 💾 2.5 GB"
+    cleaned = clean_title_emojis(raw)
+    assert "👤" not in cleaned
+    assert "⚙️" not in cleaned
+    assert "💾 2.5 GB" in cleaned
+    assert "\n" not in cleaned
+
+def test_build_rss_response_prepends_media_title():
+    items = [{
+        "title": "[RD+] 1080p - 2GB",
+        "infoHash": "aabbcc112233",
+        "size": "0"
+    }]
+    xml_result = build_rss_response(items, media_title="Inception (2010)")
+    parsed = parse_rss_xml(xml_result)
+    assert len(parsed) == 1
+    assert parsed[0]["title"] == "Inception (2010) - [RD+] 1080p - 2GB"
+
+def test_build_rss_response_avoids_duplicate_prepending():
+    items = [{
+        "title": "Inception (2010) 1080p BluRay 💾 2.1 GB 👤 100",
+        "infoHash": "ddeeff445566",
+        "size": "0"
+    }]
+    xml_result = build_rss_response(items, media_title="Inception (2010)")
+    parsed = parse_rss_xml(xml_result)
+    assert len(parsed) == 1
+    # Title should not duplicate the movie name
+    assert not parsed[0]["title"].startswith("Inception (2010) - Inception")
+    assert parsed[0]["title"] == "Inception (2010) 1080p BluRay 💾 2.1 GB"

@@ -16,9 +16,15 @@ By running this proxy, you can use Stremio's vast ecosystem of torrent streaming
   - 🎥 Peerflix
   - ☄️ Comet
   - 🏴‍☠️ The Pirate Bay Plus (TPB+)
-- **Smart Parsing**: Accurately parses sizes (`💾`) and seeders (`👤`) from the addons to ensure your quality profiles and minimum seeder limits are respected.
-- **OMDb API Integration**: Converts text-based fallback queries from Radarr/Sonarr directly into valid IMDb IDs needed by Stremio Addons.
-- **Independent Indexing**: Supports path-based routing, allowing you to configure each addon as an independent Torznab indexer (e.g., `/torrentio/api`) or aggregate them all into a single endpoint (`/api`).
+- **Dynamic Custom Addons**: Easily connect additional Stremio addons at runtime via `CUSTOM_ADDONS`.
+- **In-Memory Caching (`cachetools`)**:
+  - 24-hour TTL cache for OMDb lookups to conserve API quota.
+  - 15-minute TTL cache for provider streams to speed up indexer queries.
+- **Smart Parsing & Title Prepending**:
+  - Automatically prepends official movie/series titles to addon streams (e.g., `Inception (2010) - [RD+] 1080p - 2GB`) to ensure Radarr/Sonarr parses quality without rejecting vague titles.
+  - Accurately parses sizes (`💾`) and seeders (`👤`) into standard Torznab attributes.
+- **Web Dashboard**: Built-in sleek HTML status dashboard at `http://<server-ip>:5100/` tracking uptime, requests, cache hit ratio, provider response latency, and health.
+- **Independent & Aggregated Indexing**: Supports path-based routing, allowing you to configure each addon as an independent Torznab indexer (e.g., `/torrentio/api`) or aggregate them all into a single endpoint (`/api`).
 
 ## 🚀 Getting Started
 
@@ -37,6 +43,8 @@ services:
     container_name: stremioarrs
     environment:
       - OMDB_API_KEY=your_omdb_api_key_here
+      # Optional custom addons:
+      # - CUSTOM_ADDONS=myaddon=https://myaddon.strem.fun/stream/,addon2=https://addon2.com/stream/
     ports:
       - "5100:5100"
     restart: unless-stopped
@@ -57,6 +65,14 @@ docker run -d \
   uniextra/stremioarrs:latest
 ```
 
+## 📊 Web Dashboard
+
+Open `http://<server-ip>:5100/` in your browser to view the real-time status dashboard:
+- Total requests and cache hit ratio
+- Providers response latency and health status
+- Live active memory cache count
+- Ready-to-copy Torznab endpoint URLs
+
 ## ⚙️ Configuring Prowlarr / Radarr / Sonarr
 
 Once the container is running, head over to Prowlarr, Radarr, or Sonarr:
@@ -64,20 +80,21 @@ Once the container is running, head over to Prowlarr, Radarr, or Sonarr:
 1. Go to **Settings > Indexers** (or **Indexers** in Prowlarr).
 2. Click `+` and select **Torznab (Custom / Generic Torznab)**.
 3. Fill in the fields:
-   - **Name**: StremioArrs - Torrentio (or whatever you prefer)
-   - **URL**: You can add all addons together or configure them as independent indexers:
-     - All addons (Aggregated): `http://<server-ip>:5100` (or `/api`)
-     - Only Torrentio: `http://<server-ip>:5100/torrentio` (or `/torrentio/api`)
-     - Only Comet: `http://<server-ip>:5100/comet` (or `/comet/api`)
-     - Only Peerflix: `http://<server-ip>:5100/peerflix` (or `/peerflix/api`)
-     - Only ThePirateBay+: `http://<server-ip>:5100/thepiratebay-plus` (or `/thepiratebay-plus/api`)
+   - **Name**: StremioArrs - Aggregated (or whatever you prefer)
+   - **URL**: You can aggregate all addons or configure them as independent indexers:
+     - All addons (Aggregated): `http://<server-ip>:5100/api`
+     - Only Torrentio: `http://<server-ip>:5100/torrentio/api`
+     - Only Comet: `http://<server-ip>:5100/comet/api`
+     - Only Peerflix: `http://<server-ip>:5100/peerflix/api`
+     - Only ThePirateBay+: `http://<server-ip>:5100/thepiratebay-plus/api`
+     - Custom Addon: `http://<server-ip>:5100/<addon_name>/api`
      
-     *(Note: Prowlarr automatically appends `/api` to URLs. All variations including root, `/api`, and double `/api/api` are seamlessly handled without 404s).*
+     *(Note: Prowlarr automatically appends `/api` to URLs. All variations including `/api` and double `/api/api` are seamlessly handled without 404s).*
    - **API Key**: Leave blank or put any dummy text (not required).
    - **Categories**: 
      - For Radarr: `2000, 2010` (Movies)
      - For Sonarr: `5000, 5030, 5040` (TV)
-5. Click **Test** to verify the connection, then click **Save**.
+4. Click **Test** to verify the connection, then click **Save**.
 
 ## 🛠️ Local Development (Python)
 
@@ -89,10 +106,13 @@ git clone https://github.com/uniextra/StremioArrs.git
 cd StremioArrs
 
 # Install dependencies
-pip install -r requirements.txt # (flask, requests)
+pip install -r requirements.txt
 
 # Set your OMDb API Key
 export OMDB_API_KEY="your_omdb_api_key_here"
+
+# Run tests
+pytest test_main.py -v
 
 # Run the app
 python main.py
