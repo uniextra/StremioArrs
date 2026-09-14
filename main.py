@@ -466,6 +466,8 @@ def dashboard() -> Response:
 
         badge_class = "badge-online" if status == "online" else ("badge-error" if status == "error" else "badge-idle")
         type_badge = '<span class="badge badge-custom">Custom</span>' if is_custom else '<span class="badge badge-default">Built-in</span>'
+        base_addon_url = PROVIDERS[name] if PROVIDERS[name].endswith('/') else f"{PROVIDERS[name]}/"
+        direct_addon_url = f"{base_addon_url}movie/tt0133093.json"
 
         provider_rows.append(f"""
         <tr>
@@ -474,7 +476,7 @@ def dashboard() -> Response:
             <td><code>/{name}/api</code></td>
             <td>
                 <a href="/{name}/api?t=movie&imdbid=tt0133093" target="_blank" title="Test Internal Search (The Matrix)" style="text-decoration: none; margin-right: 8px; font-size: 1.1em;">🔍</a>
-                <a href="{PROVIDERS[name]}" target="_blank" title="Original Addon Library URL" style="text-decoration: none; font-size: 1.1em;">🔗</a>
+                <a href="{direct_addon_url}" target="_blank" title="Direct Addon Streams (The Matrix)" style="text-decoration: none; font-size: 1.1em;">🔗</a>
             </td>
             <td><span class="badge {badge_class}">{status.upper()}</span></td>
             <td>{latency}</td>

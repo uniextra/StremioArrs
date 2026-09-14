@@ -230,6 +230,7 @@ def test_web_dashboard_html_response():
     assert b"Active Providers" in resp.data
     assert b"torrentio" in resp.data
     assert b"/torrentio/api" in resp.data
+    assert b"movie/tt0133093.json" in resp.data
 
 # ---------------------------------------------------------
 # Dynamic Addons Tests
