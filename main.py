@@ -472,6 +472,10 @@ def dashboard() -> Response:
             <td class="font-bold">{name}</td>
             <td>{type_badge}</td>
             <td><code>/{name}/api</code></td>
+            <td>
+                <a href="/{name}/api?t=movie&imdbid=tt0133093" target="_blank" title="Test Internal Search (The Matrix)" style="text-decoration: none; margin-right: 8px; font-size: 1.1em;">🔍</a>
+                <a href="{PROVIDERS[name]}" target="_blank" title="Original Addon Library URL" style="text-decoration: none; font-size: 1.1em;">🔗</a>
+            </td>
             <td><span class="badge {badge_class}">{status.upper()}</span></td>
             <td>{latency}</td>
             <td>{calls} ({failed} err)</td>
@@ -645,6 +649,7 @@ def dashboard() -> Response:
                         <th>Provider</th>
                         <th>Type</th>
                         <th>Torznab Endpoint</th>
+                        <th>Links</th>
                         <th>Status</th>
                         <th>Last Latency</th>
                         <th>Calls</th>
