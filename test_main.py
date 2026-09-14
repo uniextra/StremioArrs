@@ -102,10 +102,10 @@ def test_deduplicate_streams_keeps_higher_seeders():
     assert "👤 50" in hash123_entry["title"]
 
 # ---------------------------------------------------------
-# Integration Tests for Endpoints (Torrentio, Peerflix, Comet)
+# Integration Tests for Endpoints (Torrentio, Peerflix, TorrentsDB, Meteor, TPB+)
 # ---------------------------------------------------------
 
-@pytest.mark.parametrize("site", ["torrentio", "peerflix", "comet", "thepiratebay-plus"])
+@pytest.mark.parametrize("site", ["torrentio", "peerflix", "torrentsdb", "meteor", "thepiratebay-plus"])
 def test_get_streams_movie_integration(site):
     """
     Tests fetching streams for a known movie (The Matrix - tt0133093) from each site.
@@ -121,9 +121,9 @@ def test_get_streams_movie_integration(site):
     if len(streams) > 0:
         first_stream = streams[0]
         assert "infoHash" in first_stream, f"{site} stream is missing infoHash"
-        assert "title" in first_stream or "name" in first_stream, f"{site} stream is missing title/name"
+        assert "title" in first_stream or "description" in first_stream or "name" in first_stream, f"{site} stream is missing title/description/name"
 
-@pytest.mark.parametrize("site", ["torrentio", "peerflix", "comet", "thepiratebay-plus"])
+@pytest.mark.parametrize("site", ["torrentio", "peerflix", "torrentsdb", "meteor", "thepiratebay-plus"])
 def test_get_streams_series_integration(site):
     """
     Tests fetching streams for a known series (Breaking Bad S01E01 - tt0903747) from each site.
@@ -330,3 +330,18 @@ def test_build_rss_response_avoids_duplicate_prepending():
     # Title should not duplicate the movie name
     assert not parsed[0]["title"].startswith("Inception (2010) - Inception")
     assert parsed[0]["title"] == "Inception (2010) 1080p BluRay 💾 2.1 GB"
+
+
+def test_build_rss_response_handles_meteor_format():
+    items = [{
+        "name": "[P2P] Meteor 2160p",
+        "description": "📄 The.Matrix.1999.2160p 📺 2160p 💾 35.09 GiB 👥 78 seeders",
+        "infoHash": "11223344556677889900aabbccddeeff11223344",
+        "behaviorHints": {"videoSize": 37677449216}
+    }]
+    xml_result = build_rss_response(items, media_title="The Matrix (1999)")
+    parsed = parse_rss_xml(xml_result)
+    assert len(parsed) == 1
+    assert parsed[0]["seeders"] == "78"
+    assert parsed[0]["size"] == str(int(35.09 * 1024 * 1024 * 1024))
+

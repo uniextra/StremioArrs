@@ -8,5 +8,4 @@ services:
       - "5100:5100"
     environment:
       - OMDB_API_KEY=${OMDB_API_KEY:-}
-      - COMET_URL=${COMET_URL:-https://comet.elfhosted.com/e30=/stream/}
       - CUSTOM_ADDONS=${CUSTOM_ADDONS:-}

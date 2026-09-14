@@ -4,9 +4,13 @@
 ![Docker Pulls](https://img.shields.io/docker/pulls/uniextra/stremioarrs)
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
 
-**StremioArrs** is a lightweight Torznab proxy that bridges the gap between popular Stremio Addons and the *Arr ecosystem (Radarr, Sonarr).
+**StremioArrs** is a lightweight Torznab proxy that bridges the gap between popular Stremio Addons and the *Arr ecosystem (Radarr, Sonarr, Prowlarr).
 
 By running this proxy, you can use Stremio's vast ecosystem of torrent streaming add-ons as standard indexers in your automation setups.
+
+<p align="center">
+  <img src="assets/dashboard.png" alt="StremioArrs Dashboard" width="850">
+</p>
 
 ## ✨ Features
 
@@ -14,7 +18,8 @@ By running this proxy, you can use Stremio's vast ecosystem of torrent streaming
 - **Multi-Addon Support**: Automatically aggregates streams from:
   - 🍿 Torrentio
   - 🎥 Peerflix
-  - ☄️ Comet
+  - ⚡ TorrentsDB
+  - ☄️ Meteor
   - 🏴‍☠️ The Pirate Bay Plus (TPB+)
 - **Dynamic Custom Addons**: Easily connect additional Stremio addons at runtime via `CUSTOM_ADDONS`.
 - **In-Memory Caching (`cachetools`)**:
@@ -68,10 +73,12 @@ docker run -d \
 ## 📊 Web Dashboard
 
 Open `http://<server-ip>:5100/` in your browser to view the real-time status dashboard:
-- Total requests and cache hit ratio
-- Providers response latency and health status
-- Live active memory cache count
-- Ready-to-copy Torznab endpoint URLs
+- **Metrics at a glance**: Total requests, cache hit ratio, error counter, and active in-memory cache objects.
+- **Provider health & latency**: Real-time response times (ms) and online/error statuses for every configured addon.
+- **One-click test links**:
+  - 🔍 **Internal Proxy Test**: Instantly tests Torznab XML stream generation (*The Matrix*) via your local proxy.
+  - 🔗 **Direct Addon Link**: Opens the upstream Stremio addon stream JSON directly in your browser.
+- **Configuration Cheat Sheet**: Ready-to-copy Torznab URLs for Prowlarr, Radarr, and Sonarr.
 
 ## ⚙️ Configuring Prowlarr / Radarr / Sonarr
 
@@ -84,8 +91,9 @@ Once the container is running, head over to Prowlarr, Radarr, or Sonarr:
    - **URL**: You can aggregate all addons or configure them as independent indexers:
      - All addons (Aggregated): `http://<server-ip>:5100/api`
      - Only Torrentio: `http://<server-ip>:5100/torrentio/api`
-     - Only Comet: `http://<server-ip>:5100/comet/api`
      - Only Peerflix: `http://<server-ip>:5100/peerflix/api`
+     - Only TorrentsDB: `http://<server-ip>:5100/torrentsdb/api`
+     - Only Meteor: `http://<server-ip>:5100/meteor/api`
      - Only ThePirateBay+: `http://<server-ip>:5100/thepiratebay-plus/api`
      - Custom Addon: `http://<server-ip>:5100/<addon_name>/api`
      

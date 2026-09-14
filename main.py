@@ -71,13 +71,11 @@ def parse_custom_addons(addons_str: Optional[str]) -> Dict[str, str]:
     return addons
 
 
-COMET_URL = os.getenv("COMET_URL", "https://comet.elfhosted.com/e30=/stream/")
-COMET_URL = normalize_addon_url(COMET_URL)
-
 PROVIDERS: Dict[str, str] = {
     "torrentio": os.getenv("TORRENTIO_URL", "https://torrentio.strem.fun/stream/"),
     "peerflix": os.getenv("PEERFLIX_URL", "https://addon.peerflix.mov/stream/"),
-    "comet": COMET_URL,
+    "torrentsdb": os.getenv("TORRENTSDB_URL", "https://torrentsdb.com/stream/"),
+    "meteor": os.getenv("METEOR_URL", "https://meteorfortheweebs.midnightignite.me/stream/"),
     "thepiratebay-plus": os.getenv("THEPIRATEBAY_PLUS_URL", "https://thepiratebay-plus.strem.fun/stream/"),
 }
 
@@ -103,7 +101,7 @@ metrics: Dict[str, Any] = {
 
 
 def init_provider_metrics():
-    default_keys = {"torrentio", "peerflix", "comet", "thepiratebay-plus"}
+    default_keys = {"torrentio", "peerflix", "torrentsdb", "meteor", "thepiratebay-plus"}
     for name in PROVIDERS:
         if name not in metrics["providers"]:
             metrics["providers"][name] = {
@@ -310,8 +308,8 @@ def deduplicate_streams(streams: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
 
         norm_hash = info_hash.lower()
-        title = stream.get("title") or ""
-        peer_match = re.search(r'👤\s*(\d+)', title)
+        title = stream.get("title") or stream.get("description") or stream.get("name") or ""
+        peer_match = re.search(r'[👤👥]\s*(\d+)', title) or re.search(r'(\d+)\s*seeders', title, re.IGNORECASE)
         seeders = int(peer_match.group(1)) if peer_match else 0
 
         if norm_hash not in best_streams or seeders > best_streams[norm_hash][0]:
@@ -349,8 +347,8 @@ def clean_title_emojis(text: str) -> str:
         return ""
     # Replace newlines and tabs with spaces
     t = re.sub(r'[\r\n\t]+', ' ', text)
-    # Remove seeders emoji and number (e.g. 👤 50)
-    t = re.sub(r'👤\s*\d*', '', t)
+    # Remove seeders emoji and number (e.g. 👤 50, 👥 78 seeders)
+    t = re.sub(r'[👤👥]\s*\d*(?:\s*seeders)?', '', t, flags=re.IGNORECASE)
     # Remove emojis and symbols, keeping standard Latin alphanumeric, punctuation, and 💾
     t = re.sub(r'[^\x00-\x7F\u00A0-\u024F\u1E00-\u1EFF💾]+', ' ', t)
     # Collapse multiple spaces and trim
@@ -365,24 +363,24 @@ def build_rss_response(items: List[Dict[str, Any]], category_id: str = "2000", i
     ET.SubElement(channel, "title").text = "Torrentio results"
 
     for item in items:
-        raw_title = item.get("title") or item.get("name") or "Torrent"
+        raw_title = item.get("title") or item.get("description") or item.get("name") or "Torrent"
         infohash = item.get("infoHash")
-        raw_size = item.get("size") or "0"
+        raw_size = item.get("size") or (item.get("behaviorHints", {}).get("videoSize") if isinstance(item.get("behaviorHints"), dict) else None) or "0"
 
         if not infohash:
             continue
 
         # 🔍 Extract size and peers from title before cleaning
-        size_match = re.search(r'💾\s*([\d.]+)\s*(GB|MB)', raw_title)
-        peer_match = re.search(r'👤\s*(\d+)', raw_title)
+        size_match = re.search(r'💾\s*([\d.]+)\s*(GB|MB|GiB|MiB)', raw_title, re.IGNORECASE)
+        peer_match = re.search(r'[👤👥]\s*(\d+)', raw_title) or re.search(r'(\d+)\s*seeders', raw_title, re.IGNORECASE)
 
         # 🧮 Convert size to bytes
         if size_match:
             size_value = float(size_match.group(1))
-            size_unit = size_match.group(2)
-            if size_unit == "GB":
+            size_unit = size_match.group(2).upper()
+            if size_unit in ("GB", "GIB"):
                 size_bytes = int(size_value * 1024 * 1024 * 1024)
-            elif size_unit == "MB":
+            elif size_unit in ("MB", "MIB"):
                 size_bytes = int(size_value * 1024 * 1024)
             else:
                 size_bytes = 0
@@ -668,7 +666,7 @@ def dashboard() -> Response:
             <h3>Prowlarr / Radarr / Sonarr Configuration</h3>
             <ul>
                 <li><strong>Aggregated Torznab URL:</strong> <code>http://&lt;host&gt;:5100/api</code> (queries all active providers concurrently)</li>
-                <li><strong>Individual Provider URL:</strong> <code>http://&lt;host&gt;:5100/&lt;provider&gt;/api</code> (e.g., <code>/torrentio/api</code>, <code>/comet/api</code>)</li>
+                <li><strong>Individual Provider URL:</strong> <code>http://&lt;host&gt;:5100/&lt;provider&gt;/api</code> (e.g., <code>/torrentio/api</code>, <code>/peerflix/api</code>)</li>
                 <li><strong>Categories:</strong> Movies: <code>2000, 2010</code> | TV: <code>5000, 5030, 5040</code></li>
                 <li><strong>OMDb Status:</strong> {'<span class="badge badge-online">API Key Configured</span>' if OMDB_API_KEY else '<span class="badge badge-error">API Key Missing</span>'}</li>
             </ul>
