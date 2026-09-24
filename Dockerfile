@@ -2,11 +2,19 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Create unprivileged user and group
+RUN groupadd -g 1000 stremioarrs && \
+    useradd -u 1000 -g stremioarrs -s /bin/sh -d /app stremioarrs
+
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Copy source code with ownership assigned to the unprivileged user
+COPY --chown=stremioarrs:stremioarrs . .
+
+# Switch to non-root user
+USER stremioarrs
 
 EXPOSE 5100
 
