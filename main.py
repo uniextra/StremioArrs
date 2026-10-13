@@ -76,6 +76,7 @@ PROVIDERS: Dict[str, str] = {
     "peerflix": os.getenv("PEERFLIX_URL", "https://addon.peerflix.mov/stream/"),
     "torrentsdb": os.getenv("TORRENTSDB_URL", "https://torrentsdb.com/stream/"),
     "meteor": os.getenv("METEOR_URL", "https://meteorfortheweebs.midnightignite.me/stream/"),
+    "hydra": os.getenv("HYDRA_URL", "https://hydra-torrent.noe359866.workers.dev/cfg/eyJ2IjoxLCJzayI6InRvcnJlbnQifQ/stream/"),
     "thepiratebay-plus": os.getenv("THEPIRATEBAY_PLUS_URL", "https://thepiratebay-plus.strem.fun/stream/"),
 }
 
@@ -101,7 +102,7 @@ metrics: Dict[str, Any] = {
 
 
 def init_provider_metrics():
-    default_keys = {"torrentio", "peerflix", "torrentsdb", "meteor", "thepiratebay-plus"}
+    default_keys = {"torrentio", "peerflix", "torrentsdb", "meteor", "hydra", "thepiratebay-plus"}
     for name in PROVIDERS:
         if name not in metrics["providers"]:
             metrics["providers"][name] = {
@@ -342,15 +343,15 @@ def fetch_all_streams(sites: List[str], imdb_id: str, season: Optional[str] = No
 
 
 def clean_title_emojis(text: str) -> str:
-    """Cleans up emojis from torrent title except 💾 (preserving size display), cleans newlines and collapses whitespace."""
+    """Cleans up emojis from torrent title except 💾 and ◈ (preserving size display), cleans newlines and collapses whitespace."""
     if not text:
         return ""
     # Replace newlines and tabs with spaces
     t = re.sub(r'[\r\n\t]+', ' ', text)
-    # Remove seeders emoji and number (e.g. 👤 50, 👥 78 seeders)
-    t = re.sub(r'[👤👥]\s*\d*(?:\s*seeders)?', '', t, flags=re.IGNORECASE)
-    # Remove emojis and symbols, keeping standard Latin alphanumeric, punctuation, and 💾
-    t = re.sub(r'[^\x00-\x7F\u00A0-\u024F\u1E00-\u1EFF💾]+', ' ', t)
+    # Remove seeders emoji and number, including :leechers (e.g. 👤 50, 👥 78 seeders, 👤100:60)
+    t = re.sub(r'[👤👥]\s*\d*(?::\d+)?(?:\s*seeders)?', '', t, flags=re.IGNORECASE)
+    # Remove emojis and symbols, keeping standard Latin alphanumeric, punctuation, 💾, and ◈
+    t = re.sub(r'[^\x00-\x7F\u00A0-\u024F\u1E00-\u1EFF💾◈]+', ' ', t)
     # Collapse multiple spaces and trim
     return re.sub(r'\s+', ' ', t).strip()
 
@@ -370,8 +371,8 @@ def build_rss_response(items: List[Dict[str, Any]], category_id: str = "2000", i
         if not infohash:
             continue
 
-        # 🔍 Extract size and peers from title before cleaning
-        size_match = re.search(r'💾\s*([\d.]+)\s*(GB|MB|GiB|MiB)', raw_title, re.IGNORECASE)
+        # 🔍 Extract size and peers from title before cleaning (supports 💾 and ◈)
+        size_match = re.search(r'[💾◈]\s*([\d.]+)\s*(GB|MB|GiB|MiB)', raw_title, re.IGNORECASE)
         peer_match = re.search(r'[👤👥]\s*(\d+)', raw_title) or re.search(r'(\d+)\s*seeders', raw_title, re.IGNORECASE)
 
         # 🧮 Convert size to bytes
@@ -692,6 +693,8 @@ def torznab_api(provider: Optional[str] = None, subpath: Optional[str] = None) -
         provider = "all"
     else:
         provider = provider.lower()
+        if provider == "hydra-torrents":
+            provider = "hydra"
 
     if provider != "all" and provider not in PROVIDERS:
         return Response("<error>Unknown provider</error>", status=404, mimetype="application/xml")

@@ -102,10 +102,10 @@ def test_deduplicate_streams_keeps_higher_seeders():
     assert "👤 50" in hash123_entry["title"]
 
 # ---------------------------------------------------------
-# Integration Tests for Endpoints (Torrentio, Peerflix, TorrentsDB, Meteor, TPB+)
+# Integration Tests for Endpoints (Torrentio, Peerflix, TorrentsDB, Meteor, Hydra, TPB+)
 # ---------------------------------------------------------
 
-@pytest.mark.parametrize("site", ["torrentio", "peerflix", "torrentsdb", "meteor", "thepiratebay-plus"])
+@pytest.mark.parametrize("site", ["torrentio", "peerflix", "torrentsdb", "meteor", "hydra", "thepiratebay-plus"])
 def test_get_streams_movie_integration(site):
     """
     Tests fetching streams for a known movie (The Matrix - tt0133093) from each site.
@@ -123,7 +123,7 @@ def test_get_streams_movie_integration(site):
         assert "infoHash" in first_stream, f"{site} stream is missing infoHash"
         assert "title" in first_stream or "description" in first_stream or "name" in first_stream, f"{site} stream is missing title/description/name"
 
-@pytest.mark.parametrize("site", ["torrentio", "peerflix", "torrentsdb", "meteor", "thepiratebay-plus"])
+@pytest.mark.parametrize("site", ["torrentio", "peerflix", "torrentsdb", "meteor", "hydra", "thepiratebay-plus"])
 def test_get_streams_series_integration(site):
     """
     Tests fetching streams for a known series (Breaking Bad S01E01 - tt0903747) from each site.
@@ -344,4 +344,26 @@ def test_build_rss_response_handles_meteor_format():
     assert len(parsed) == 1
     assert parsed[0]["seeders"] == "78"
     assert parsed[0]["size"] == str(int(35.09 * 1024 * 1024 * 1024))
+
+
+def test_build_rss_response_handles_hydra_format():
+    items = [{
+        "title": "The Matrix (1999) 1080p ◈ 18.45 GB 👤100:60",
+        "infoHash": "556677889900aabbccddeeff1122334455667788",
+        "size": "0"
+    }]
+    xml_result = build_rss_response(items, media_title="The Matrix (1999)")
+    parsed = parse_rss_xml(xml_result)
+    assert len(parsed) == 1
+    assert parsed[0]["seeders"] == "100"
+    assert parsed[0]["size"] == str(int(18.45 * 1024 * 1024 * 1024))
+    assert ":60" not in parsed[0]["title"]
+
+
+def test_hydra_alias_route():
+    client = app.test_client()
+    resp = client.get("/hydra-torrents/api?t=caps")
+    assert resp.status_code == 200
+    assert "Hydra Proxy" in resp.data.decode("utf-8")
+
 

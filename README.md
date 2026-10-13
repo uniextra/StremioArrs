@@ -20,6 +20,7 @@ By running this proxy, you can use Stremio's vast ecosystem of torrent streaming
   - 🎥 Peerflix
   - ⚡ TorrentsDB
   - ☄️ Meteor
+  - 🐉 Hydra Torrents (Multi-tracker & Spanish releases)
   - 🏴‍☠️ The Pirate Bay Plus (TPB+)
 - **Dynamic Custom Addons**: Easily connect additional Stremio addons at runtime via `CUSTOM_ADDONS`.
 - **In-Memory Caching (`cachetools`)**:
@@ -94,6 +95,7 @@ Once the container is running, head over to Prowlarr, Radarr, or Sonarr:
      - Only Peerflix: `http://<server-ip>:5100/peerflix/api`
      - Only TorrentsDB: `http://<server-ip>:5100/torrentsdb/api`
      - Only Meteor: `http://<server-ip>:5100/meteor/api`
+     - Only Hydra Torrents: `http://<server-ip>:5100/hydra/api`
      - Only ThePirateBay+: `http://<server-ip>:5100/thepiratebay-plus/api`
      - Custom Addon: `http://<server-ip>:5100/<addon_name>/api`
      
