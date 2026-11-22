@@ -1,5 +1,10 @@
+import time
+import threading
+from unittest.mock import MagicMock, patch
 import pytest
+import requests
 import xml.etree.ElementTree as ET
+import main
 from main import (
     app,
     get_streams,
@@ -365,5 +370,282 @@ def test_hydra_alias_route():
     resp = client.get("/hydra-torrents/api?t=caps")
     assert resp.status_code == 200
     assert "Hydra Proxy" in resp.data.decode("utf-8")
+
+
+# ---------------------------------------------------------
+# Performance & Resilience Tests (TDD)
+# ---------------------------------------------------------
+
+def test_fetch_all_streams_non_blocking_timeout():
+    release_slow = threading.Event()
+
+    def fake_get_streams(site, imdb_id, season=None, episode=None, content_type="movie"):
+        if site == "fast":
+            return [{"title": "Fast 1080p 💾 2.0 GB 👤 50", "infoHash": "fast123456"}]
+        # Block until released or 3.0s elapses
+        release_slow.wait(timeout=3.0)
+        return [{"title": "Slow 1080p 💾 2.0 GB 👤 10", "infoHash": "slow123456"}]
+
+    start = time.perf_counter()
+    try:
+        with patch.object(main, "get_streams", side_effect=fake_get_streams):
+            streams = main.fetch_all_streams(["fast", "slow"], "tt0133093", timeout=0.3)
+        elapsed = time.perf_counter() - start
+    finally:
+        release_slow.set()
+
+    assert elapsed < 1.0, f"fetch_all_streams blocked for {elapsed:.2f}s"
+    assert len(streams) == 1
+    assert streams[0]["infoHash"] == "fast123456"
+
+
+def test_circuit_breaker_trips_and_recovers():
+    site = "torrentio"
+    with cache_lock:
+        stream_cache.clear()
+        main.negative_stream_cache.clear()
+    main.provider_cb.pop(site, None)
+
+    try:
+        threshold = main.CB_FAILURE_THRESHOLD
+        with patch.object(main.session, "get", side_effect=requests.Timeout("timed out")) as mock_get:
+            for i in range(threshold):
+                res = get_streams(site, f"tt900000{i}", content_type="movie")
+                assert res == []
+
+            assert mock_get.call_count == threshold
+            assert main.is_provider_circuit_open(site) is True
+            assert metrics["providers"][site]["status"] == "cooldown"
+
+            # Subsequent call while circuit is open must short-circuit with 0 HTTP calls
+            res_open = get_streams(site, "tt9000099", content_type="movie")
+            assert res_open == []
+            assert mock_get.call_count == threshold
+
+        # Simulate cooldown expiry -> probe request succeeds and closes circuit
+        main.provider_cb[site]["open_until"] = time.monotonic() - 1.0
+        ok_resp = MagicMock()
+        ok_resp.status_code = 200
+        ok_resp.raise_for_status.return_value = None
+        ok_resp.json.return_value = {
+            "streams": [{"title": "Recovered 1080p 💾 2.0 GB 👤 25", "infoHash": "rec123456"}]
+        }
+        with patch.object(main.session, "get", return_value=ok_resp) as mock_get:
+            res_rec = get_streams(site, "tt9000100", content_type="movie")
+            assert len(res_rec) == 1
+            assert mock_get.call_count == 1
+            assert main.is_provider_circuit_open(site) is False
+            assert main.provider_cb[site]["failures"] == 0
+            assert metrics["providers"][site]["status"] == "online"
+    finally:
+        main.provider_cb.pop(site, None)
+        with cache_lock:
+            stream_cache.clear()
+            main.negative_stream_cache.clear()
+
+
+def test_negative_stream_cache_short_ttl():
+    site = "peerflix"
+    with cache_lock:
+        stream_cache.clear()
+        main.negative_stream_cache.clear()
+    main.provider_cb.pop(site, None)
+
+    try:
+        # 1. Empty valid response goes to negative_stream_cache, not stream_cache
+        empty_resp = MagicMock()
+        empty_resp.status_code = 200
+        empty_resp.raise_for_status.return_value = None
+        empty_resp.json.return_value = {"streams": []}
+
+        empty_key = (site, "tt8000001", None, None, "movie")
+        with patch.object(main.session, "get", return_value=empty_resp) as mock_get:
+            res1 = get_streams(site, "tt8000001", content_type="movie")
+            res2 = get_streams(site, "tt8000001", content_type="movie")
+            assert res1 == []
+            assert res2 == []
+            assert mock_get.call_count == 1
+            with cache_lock:
+                assert empty_key not in stream_cache
+                assert empty_key in main.negative_stream_cache
+
+        # 2. Network failure goes to negative_stream_cache (short TTL), not 15m stream_cache
+        err_key = (site, "tt8000002", None, None, "movie")
+        with patch.object(main.session, "get", side_effect=requests.ConnectionError("boom")) as mock_get:
+            res_err1 = get_streams(site, "tt8000002", content_type="movie")
+            res_err2 = get_streams(site, "tt8000002", content_type="movie")
+            assert res_err1 == []
+            assert res_err2 == []
+            assert mock_get.call_count == 1
+            with cache_lock:
+                assert err_key not in stream_cache
+                assert err_key in main.negative_stream_cache
+    finally:
+        main.provider_cb.pop(site, None)
+        with cache_lock:
+            stream_cache.clear()
+            main.negative_stream_cache.clear()
+
+
+def test_cinemeta_metadata_resolution_and_fallback(monkeypatch):
+    with cache_lock:
+        omdb_cache.clear()
+
+    try:
+        cinemeta_resp = MagicMock()
+        cinemeta_resp.status_code = 200
+        cinemeta_resp.raise_for_status.return_value = None
+        cinemeta_resp.json.return_value = {
+            "meta": {"name": "The Matrix", "releaseInfo": "1999"}
+        }
+
+        monkeypatch.setattr(main, "OMDB_API_KEY", None)
+        with patch.object(main.session, "get", return_value=cinemeta_resp) as mock_get:
+            meta = main.resolve_metadata_by_imdb("tt0133093", content_type="movie")
+            assert meta is not None
+            assert meta["Title"] == "The Matrix"
+            assert meta["Year"] == "1999"
+            assert meta["imdbID"] == "tt0133093"
+            assert mock_get.call_count == 1
+            assert "v3-cinemeta.strem.io/meta/movie/tt0133093.json" in mock_get.call_args[0][0]
+
+        # Should be cached now under imdb:tt0133093
+        with cache_lock:
+            assert "imdb:tt0133093" in omdb_cache
+
+        # Test fallback to OMDb when Cinemeta fails
+        omdb_fallback_resp = MagicMock()
+        omdb_fallback_resp.status_code = 200
+        omdb_fallback_resp.raise_for_status.return_value = None
+        omdb_fallback_resp.json.return_value = {
+            "Title": "Inception",
+            "Year": "2010",
+            "imdbID": "tt1375666",
+            "Response": "True",
+        }
+        monkeypatch.setattr(main, "OMDB_API_KEY", "test_key")
+
+        def side_effect_fallback(url, *args, **kwargs):
+            if "v3-cinemeta.strem.io" in url:
+                raise requests.Timeout("cinemeta timeout")
+            return omdb_fallback_resp
+
+        with patch.object(main.session, "get", side_effect=side_effect_fallback):
+            meta_fb = main.resolve_metadata_by_imdb("tt1375666", content_type="movie")
+            assert meta_fb is not None
+            assert meta_fb["Title"] == "Inception"
+            assert meta_fb["Year"] == "2010"
+    finally:
+        with cache_lock:
+            omdb_cache.clear()
+
+
+def test_singleflight_coalescing_omdb(monkeypatch):
+    with cache_lock:
+        omdb_cache.clear()
+
+    monkeypatch.setattr(main, "OMDB_API_KEY", "test_key")
+    call_counter = {"count": 0}
+    counter_lock = threading.Lock()
+
+    def slow_omdb_get(url, *args, **kwargs):
+        with counter_lock:
+            call_counter["count"] += 1
+        time.sleep(0.15)
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {
+            "Title": "Coalesced Movie",
+            "Year": "2024",
+            "imdbID": "tt7777777",
+            "Response": "True",
+        }
+        return resp
+
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            results.append(get_omdb_metadata(imdb_id="tt7777777"))
+        except Exception as exc:
+            errors.append(exc)
+
+    try:
+        with patch.object(main.session, "get", side_effect=slow_omdb_get):
+            threads = [threading.Thread(target=worker) for _ in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5.0)
+
+        assert not errors
+        assert len(results) == 5
+        assert call_counter["count"] == 1
+        assert all(r is not None and r["Title"] == "Coalesced Movie" for r in results)
+    finally:
+        with cache_lock:
+            omdb_cache.clear()
+
+
+def test_disabled_providers_filtering(monkeypatch):
+    monkeypatch.setenv("DISABLED_PROVIDERS", "meteor, peerflix")
+    disabled = main.parse_disabled_providers()
+    assert disabled == {"meteor", "peerflix"}
+
+    active = main.get_active_sites("all")
+    assert "torrentio" in active
+    assert "hydra" in active
+    assert "meteor" not in active
+    assert "peerflix" not in active
+
+    # Direct single-provider lookup still allows explicit selection or empty check
+    monkeypatch.setenv("DISABLED_PROVIDERS", "")
+    active_all = main.get_active_sites("all")
+    assert "meteor" in active_all
+    assert "peerflix" in active_all
+
+
+def test_parallel_metadata_and_streams_in_torznab_api(monkeypatch):
+    with cache_lock:
+        omdb_cache.clear()
+        stream_cache.clear()
+        main.negative_stream_cache.clear()
+
+    def fake_resolve_meta(imdb_id, content_type="movie"):
+        time.sleep(0.15)
+        return {"Title": "The Matrix", "Year": "1999", "imdbID": imdb_id, "Response": "True"}
+
+    def fake_fetch_all(sites, imdb_id, season=None, episode=None, content_type="movie", timeout=None):
+        time.sleep(0.15)
+        return [{
+            "title": "1080p BluRay 💾 2.1 GB 👤 100",
+            "infoHash": "aabbcc112233445566",
+            "size": "0",
+        }]
+
+    try:
+        client = app.test_client()
+        start = time.perf_counter()
+        with patch.object(main, "resolve_metadata_by_imdb", side_effect=fake_resolve_meta) as mock_meta, \
+             patch.object(main, "fetch_all_streams", side_effect=fake_fetch_all) as mock_streams:
+            resp = client.get("/api?t=movie&imdbid=tt0133093")
+        elapsed = time.perf_counter() - start
+
+        assert resp.status_code == 200
+        assert mock_meta.call_count == 1
+        assert mock_streams.call_count == 1
+        # If run sequentially (0.15 + 0.15), elapsed >= 0.30s; in parallel, ~0.15s (< 0.28s)
+        assert elapsed < 0.28, f"Expected parallel execution, took {elapsed:.3f}s"
+        parsed = parse_rss_xml(resp.data)
+        assert len(parsed) == 1
+        assert parsed[0]["title"].startswith("The Matrix (1999) - ")
+    finally:
+        with cache_lock:
+            omdb_cache.clear()
+            stream_cache.clear()
+            main.negative_stream_cache.clear()
+
 
 
