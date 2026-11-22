@@ -3,8 +3,8 @@ import re
 import time
 import logging
 import threading
-from typing import Optional, List, Dict, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, List, Dict, Any, Callable, Tuple
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from datetime import datetime, UTC
 from email.utils import format_datetime
 import xml.etree.ElementTree as ET
@@ -23,18 +23,52 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
-REQUEST_TIMEOUT = (3.05, 5)  # (connect_timeout, read_timeout)
+CINEMETA_BASE_URL = os.getenv("CINEMETA_URL", "https://v3-cinemeta.strem.io/meta").rstrip("/")
 
-# HTTP Session with Connection Pooling & Retries
+CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "2.0"))
+READ_TIMEOUT = float(os.getenv("READ_TIMEOUT", "4.0"))
+REQUEST_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)  # (connect_timeout, read_timeout)
+METADATA_TIMEOUT = (
+    float(os.getenv("METADATA_CONNECT_TIMEOUT", "1.5")),
+    float(os.getenv("METADATA_READ_TIMEOUT", "2.0")),
+)
+FETCH_ALL_TIMEOUT = float(os.getenv("FETCH_ALL_TIMEOUT", "5.5"))
+METADATA_WAIT_TIMEOUT = float(os.getenv("METADATA_WAIT_TIMEOUT", "1.5"))
+SINGLEFLIGHT_WAIT_TIMEOUT = float(os.getenv("SINGLEFLIGHT_WAIT_TIMEOUT", "6.0"))
+
+CB_FAILURE_THRESHOLD = int(os.getenv("CB_FAILURE_THRESHOLD", "3"))
+CB_COOLDOWN_SECONDS = float(os.getenv("CB_COOLDOWN_SECONDS", "180"))
+NEGATIVE_CACHE_TTL = int(os.getenv("NEGATIVE_CACHE_TTL", "60"))
+
+# Pre-compiled regular expressions for hot-path stream and query parsing
+PEER_EMOJI_RE = re.compile(r'[👤👥]\s*(\d+)')
+PEER_TEXT_RE = re.compile(r'(\d+)\s*seeders', re.IGNORECASE)
+SIZE_RE = re.compile(r'[💾◈]\s*([\d.]+)\s*(GB|MB|GiB|MiB)', re.IGNORECASE)
+WHITESPACE_CTRL_RE = re.compile(r'[\r\n\t]+')
+SEEDERS_CLEAN_RE = re.compile(r'[👤👥]\s*\d*(?::\d+)?(?:\s*seeders)?', re.IGNORECASE)
+NON_LATIN_EMOJI_RE = re.compile(r'[^\x00-\x7F\u00A0-\u024F\u1E00-\u1EFF💾◈]+')
+MULTI_SPACE_RE = re.compile(r'\s+')
+QUERY_YEAR_RE = re.compile(r"^(.*?)(?:\s+(\d{4}))?$")
+YEAR_PREFIX_RE = re.compile(r"(\d{4})")
+IMDB_ID_RE = re.compile(r"^tt\d{5,10}$")
+
+# Shared reusable thread pool to avoid per-request pool creation and blocking shutdown(wait=True)
+STREAM_EXECUTOR = ThreadPoolExecutor(
+    max_workers=int(os.getenv("EXECUTOR_MAX_WORKERS", "24")),
+    thread_name_prefix="stremioarrs"
+)
+
+# HTTP Session with Connection Pooling & Zero Timeout Retries (fail fast during interactive searches)
 session = requests.Session()
 retries = Retry(
-    total=1,
-    backoff_factor=0.2,
-    status_forcelist=[500, 502, 503, 504],
-    respect_retry_after_header=False,
+    total=0,
+    connect=0,
+    read=0,
+    redirect=2,
+    status=0,
     raise_on_status=False
 )
-adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
+adapter = HTTPAdapter(max_retries=retries, pool_connections=32, pool_maxsize=32)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
 session.headers.update({
@@ -44,6 +78,16 @@ session.headers.update({
 # ---------------------------------------------------------
 # Dynamic Addons Helpers & Providers
 # ---------------------------------------------------------
+
+PROVIDER_ALIASES: Dict[str, str] = {
+    "hydra-torrents": "hydra",
+}
+
+
+def canonicalize_provider_name(name: str) -> str:
+    cleaned = name.strip().lower()
+    return PROVIDER_ALIASES.get(cleaned, cleaned)
+
 
 def normalize_addon_url(url: str) -> str:
     url = url.strip()
@@ -71,6 +115,27 @@ def parse_custom_addons(addons_str: Optional[str]) -> Dict[str, str]:
     return addons
 
 
+def parse_disabled_providers(disabled_str: Optional[str] = None) -> set[str]:
+    """Parses DISABLED_PROVIDERS env var into a normalized set of provider keys."""
+    if disabled_str is None:
+        disabled_str = os.getenv("DISABLED_PROVIDERS", "")
+    if not disabled_str:
+        return set()
+    return {
+        canonicalize_provider_name(item)
+        for item in re.split(r'[,;\n]', disabled_str)
+        if item.strip()
+    }
+
+
+def get_active_sites(provider: str = "all") -> List[str]:
+    """Returns active provider keys for the requested provider route."""
+    if provider != "all":
+        return [provider]
+    disabled = parse_disabled_providers()
+    return [name for name in PROVIDERS if name not in disabled]
+
+
 PROVIDERS: Dict[str, str] = {
     "torrentio": os.getenv("TORRENTIO_URL", "https://torrentio.strem.fun/stream/"),
     "peerflix": os.getenv("PEERFLIX_URL", "https://addon.peerflix.mov/stream/"),
@@ -82,13 +147,22 @@ PROVIDERS: Dict[str, str] = {
 
 
 # ---------------------------------------------------------
-# In-Memory Caching & Metrics
+# In-Memory Caching, Circuit Breaker, Singleflight & Metrics
 # ---------------------------------------------------------
 
-# Caches: OMDb (24h TTL) and Streams (15m TTL)
+# Caches: Metadata (24h TTL), Streams (15m TTL), Negative/Empty Streams (short TTL)
 omdb_cache: TTLCache = TTLCache(maxsize=4096, ttl=86400)
 stream_cache: TTLCache = TTLCache(maxsize=1024, ttl=900)
+negative_stream_cache: TTLCache = TTLCache(maxsize=1024, ttl=NEGATIVE_CACHE_TTL)
 cache_lock = threading.Lock()
+
+# Singleflight coordination for concurrent identical requests
+_inflight_lock = threading.Lock()
+_inflight_events: Dict[Any, threading.Event] = {}
+
+# Per-provider circuit breaker state
+cb_lock = threading.Lock()
+provider_cb: Dict[str, Dict[str, Any]] = {}
 
 metrics_lock = threading.Lock()
 metrics: Dict[str, Any] = {
@@ -135,9 +209,142 @@ def track_request_metric():
         metrics["total_requests"] += 1
 
 
+def is_provider_circuit_open(site: str) -> bool:
+    """Returns True if the provider is currently in circuit-breaker cooldown."""
+    with cb_lock:
+        state = provider_cb.get(site)
+        if not state:
+            return False
+        open_until = state.get("open_until", 0.0)
+        if open_until <= 0.0:
+            return False
+        if time.monotonic() < open_until:
+            return True
+        # Cooldown elapsed: allow a half-open probe call
+        state["open_until"] = 0.0
+        return False
+
+
+def record_provider_success(site: str) -> None:
+    """Resets the provider's circuit breaker failure counter after a successful response."""
+    with cb_lock:
+        provider_cb[site] = {"failures": 0, "open_until": 0.0}
+
+
+def record_provider_failure(site: str) -> bool:
+    """Records a provider failure and opens its circuit breaker if threshold is reached."""
+    tripped = False
+    with cb_lock:
+        state = provider_cb.setdefault(site, {"failures": 0, "open_until": 0.0})
+        state["failures"] = state.get("failures", 0) + 1
+        if state["failures"] >= CB_FAILURE_THRESHOLD:
+            state["open_until"] = time.monotonic() + CB_COOLDOWN_SECONDS
+            tripped = True
+    return tripped
+
+
+def _run_singleflight(
+    flight_key: Any,
+    cache_lookup_fn: Callable[[], Tuple[bool, Any]],
+    fetch_fn: Callable[[], Any],
+    default_value: Any = None,
+) -> Any:
+    """Coalesces concurrent identical cache-miss fetches so only one leader executes fetch_fn."""
+    found, cached = cache_lookup_fn()
+    if found:
+        with metrics_lock:
+            metrics["cache_hits"] += 1
+        return cached
+
+    with _inflight_lock:
+        existing_event = _inflight_events.get(flight_key)
+        if existing_event is None:
+            found, cached = cache_lookup_fn()
+            if found:
+                with metrics_lock:
+                    metrics["cache_hits"] += 1
+                return cached
+            leader_event = threading.Event()
+            _inflight_events[flight_key] = leader_event
+            is_leader = True
+        else:
+            is_leader = False
+
+    if not is_leader:
+        if existing_event.wait(timeout=SINGLEFLIGHT_WAIT_TIMEOUT):
+            found, cached = cache_lookup_fn()
+            if found:
+                with metrics_lock:
+                    metrics["cache_hits"] += 1
+                return cached
+        return default_value
+
+    with metrics_lock:
+        metrics["cache_misses"] += 1
+
+    try:
+        return fetch_fn()
+    finally:
+        with _inflight_lock:
+            _inflight_events.pop(flight_key, None)
+        leader_event.set()
+
+
 # ---------------------------------------------------------
-# OMDb Service with Caching
+# Metadata Services (Cinemeta Primary + OMDb Fallback) with Caching
 # ---------------------------------------------------------
+
+def _lookup_omdb_cache(cache_key: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    with cache_lock:
+        if cache_key in omdb_cache:
+            return True, omdb_cache[cache_key]
+    return False, None
+
+
+def get_cinemeta_metadata(imdb_id: str, content_type: str = "movie") -> Optional[Dict[str, Any]]:
+    """Fetches fast movie/series metadata from Stremio's Cinemeta CDN without an API key."""
+    if not imdb_id or not IMDB_ID_RE.match(imdb_id):
+        return None
+    meta_type = "series" if content_type == "series" else "movie"
+    cache_key = f"imdb:{imdb_id}"
+
+    def fetch_cinemeta() -> Optional[Dict[str, Any]]:
+        url = f"{CINEMETA_BASE_URL}/{meta_type}/{imdb_id}.json"
+        try:
+            resp = session.get(url, timeout=METADATA_TIMEOUT)
+            resp.raise_for_status()
+            payload = resp.json()
+            meta = payload.get("meta") if isinstance(payload, dict) else None
+            if not isinstance(meta, dict):
+                return None
+            name = (meta.get("name") or "").strip()
+            if not name:
+                return None
+
+            raw_year = str(meta.get("releaseInfo") or meta.get("year") or "")
+            year_match = YEAR_PREFIX_RE.search(raw_year)
+            year = year_match.group(1) if year_match else ""
+
+            data = {
+                "Title": name,
+                "Year": year,
+                "imdbID": imdb_id,
+                "Response": "True",
+            }
+            with cache_lock:
+                omdb_cache[cache_key] = data
+            return data
+        except Exception as e:
+            logger.debug(f"⚠️ Cinemeta lookup failed for {imdb_id}: {e}")
+            return None
+
+    return _run_singleflight(
+        flight_key=("cinemeta", cache_key),
+        cache_lookup_fn=lambda: _lookup_omdb_cache(cache_key),
+        fetch_fn=fetch_cinemeta,
+        default_value=None,
+    )
+
 
 def get_omdb_metadata(title: Optional[str] = None, year: Optional[str] = None, imdb_id: Optional[str] = None, content_type: str = "movie") -> Optional[Dict[str, Any]]:
     if imdb_id:
@@ -147,46 +354,66 @@ def get_omdb_metadata(title: Optional[str] = None, year: Optional[str] = None, i
     else:
         return None
 
-    with cache_lock:
-        if cache_key in omdb_cache:
-            with metrics_lock:
-                metrics["cache_hits"] += 1
-            return omdb_cache[cache_key]
-        with metrics_lock:
-            metrics["cache_misses"] += 1
-
-    if not OMDB_API_KEY:
-        return None
-
-    try:
-        omdb_url = "http://www.omdbapi.com/"
-        params: Dict[str, str] = {"apikey": OMDB_API_KEY}
-        if imdb_id:
-            params["i"] = imdb_id
-        else:
-            params["t"] = title.strip()
-            params["type"] = content_type
-            if year:
-                params["y"] = year.strip()
-
-        resp = session.get(omdb_url, params=params, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("Response") == "False":
-            with cache_lock:
-                omdb_cache[cache_key] = None
+    def fetch_omdb() -> Optional[Dict[str, Any]]:
+        if not OMDB_API_KEY:
             return None
 
-        with cache_lock:
-            omdb_cache[cache_key] = data
-            if data.get("imdbID"):
-                omdb_cache[f"imdb:{data['imdbID']}"] = data
-        return data
-    except Exception as e:
-        logger.error(f"❌ OMDb lookup failed: {e}")
-        with metrics_lock:
-            metrics["errors"] += 1
+        try:
+            omdb_url = "http://www.omdbapi.com/"
+            params: Dict[str, str] = {"apikey": OMDB_API_KEY}
+            if imdb_id:
+                params["i"] = imdb_id
+            else:
+                params["t"] = title.strip()
+                params["type"] = content_type
+                if year:
+                    params["y"] = year.strip()
+
+            resp = session.get(omdb_url, params=params, timeout=METADATA_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("Response") == "False":
+                with cache_lock:
+                    omdb_cache[cache_key] = None
+                return None
+
+            with cache_lock:
+                omdb_cache[cache_key] = data
+                if data.get("imdbID"):
+                    omdb_cache[f"imdb:{data['imdbID']}"] = data
+            return data
+        except Exception as e:
+            logger.error(f"❌ OMDb lookup failed: {e}")
+            with metrics_lock:
+                metrics["errors"] += 1
+            return None
+
+    return _run_singleflight(
+        flight_key=("omdb", cache_key),
+        cache_lookup_fn=lambda: _lookup_omdb_cache(cache_key),
+        fetch_fn=fetch_omdb,
+        default_value=None,
+    )
+
+
+def resolve_metadata_by_imdb(imdb_id: str, content_type: str = "movie") -> Optional[Dict[str, Any]]:
+    """Resolves IMDb metadata using fast Cinemeta CDN first, falling back to OMDb if needed."""
+    if not imdb_id:
         return None
+    cache_key = f"imdb:{imdb_id}"
+    found, cached = _lookup_omdb_cache(cache_key)
+    if found:
+        with metrics_lock:
+            metrics["cache_hits"] += 1
+        return cached
+
+    data = get_cinemeta_metadata(imdb_id, content_type=content_type)
+    if data:
+        return data
+
+    if OMDB_API_KEY:
+        return get_omdb_metadata(imdb_id=imdb_id, content_type=content_type)
+    return None
 
 
 # ---------------------------------------------------------
@@ -215,16 +442,40 @@ def get_torznab_caps(provider_name: str) -> str:
 </caps>'''
 
 
-def get_streams(site: str, imdb_id: str, season: Optional[str] = None, episode: Optional[str] = None, content_type: str = "movie") -> List[Dict[str, Any]]:
-    cache_key = (site, imdb_id, str(season) if season is not None else None, str(episode) if episode is not None else None, content_type)
-    
+def _lookup_stream_cache(cache_key: tuple) -> Tuple[bool, List[Dict[str, Any]]]:
     with cache_lock:
         if cache_key in stream_cache:
-            with metrics_lock:
-                metrics["cache_hits"] += 1
-            return list(stream_cache[cache_key])
+            return True, list(stream_cache[cache_key])
+        if cache_key in negative_stream_cache:
+            return True, list(negative_stream_cache[cache_key])
+    return False, []
+
+
+def _handle_provider_failure(site: str, start_time: float, cache_key: tuple, message: str) -> List[Dict[str, Any]]:
+    elapsed_ms = round((time.time() - start_time) * 1000, 1)
+    tripped = record_provider_failure(site)
+    logger.error(message)
+    with metrics_lock:
+        metrics["errors"] += 1
+        prov_m = metrics["providers"].setdefault(site, {})
+        prov_m["total_calls"] = prov_m.get("total_calls", 0) + 1
+        prov_m["failed_calls"] = prov_m.get("failed_calls", 0) + 1
+        prov_m["last_response_time_ms"] = elapsed_ms
+        prov_m["status"] = "cooldown" if tripped else "error"
+        prov_m["last_checked"] = datetime.now(UTC).strftime("%H:%M:%S UTC")
+    with cache_lock:
+        negative_stream_cache[cache_key] = []
+    return []
+
+
+def get_streams(site: str, imdb_id: str, season: Optional[str] = None, episode: Optional[str] = None, content_type: str = "movie") -> List[Dict[str, Any]]:
+    cache_key = (site, imdb_id, str(season) if season is not None else None, str(episode) if episode is not None else None, content_type)
+
+    found, cached = _lookup_stream_cache(cache_key)
+    if found:
         with metrics_lock:
-            metrics["cache_misses"] += 1
+            metrics["cache_hits"] += 1
+        return cached
 
     base_url = PROVIDERS.get(site)
     if not base_url:
@@ -243,60 +494,60 @@ def get_streams(site: str, imdb_id: str, season: Optional[str] = None, episode: 
         logger.error(f"❌ Unknown content_type for {site}: {content_type}")
         return []
 
-    logger.info(f"🔍 Fetching streams from: {url}")
-    start_time = time.time()
-
-    try:
-        resp = session.get(url, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        elapsed_ms = round((time.time() - start_time) * 1000, 1)
-
-        with metrics_lock:
-            prov_m = metrics["providers"].setdefault(site, {})
-            prov_m["total_calls"] = prov_m.get("total_calls", 0) + 1
-            prov_m["last_response_time_ms"] = elapsed_ms
-            prov_m["last_status_code"] = resp.status_code
-            prov_m["status"] = "online"
-            prov_m["last_checked"] = datetime.now(UTC).strftime("%H:%M:%S UTC")
-
-        data = resp.json()
-        logger.info(f"📦 Streams fetched successfully from {site} ({elapsed_ms}ms)")
-        results: List[Dict[str, Any]] = []
-        if isinstance(data, dict):
-            raw_streams = data.get("streams", [])
-            if isinstance(raw_streams, list):
-                results = [s for s in raw_streams if isinstance(s, dict) and s.get("infoHash")]
-        else:
-            logger.warning(f"⚠️ Warning: Expected dict from {site} but got {type(data)}")
-
-        with cache_lock:
-            stream_cache[cache_key] = results
-
-        return results
-
-    except requests.RequestException as e:
-        elapsed_ms = round((time.time() - start_time) * 1000, 1)
-        logger.error(f"❌ Network error fetching from {site}: {e}")
-        with metrics_lock:
-            metrics["errors"] += 1
-            prov_m = metrics["providers"].setdefault(site, {})
-            prov_m["total_calls"] = prov_m.get("total_calls", 0) + 1
-            prov_m["failed_calls"] = prov_m.get("failed_calls", 0) + 1
-            prov_m["last_response_time_ms"] = elapsed_ms
-            prov_m["status"] = "error"
-            prov_m["last_checked"] = datetime.now(UTC).strftime("%H:%M:%S UTC")
+    if is_provider_circuit_open(site):
+        logger.debug(f"⚡ Skipping {site} (circuit breaker open/cooldown)")
         return []
-    except Exception as e:
-        elapsed_ms = round((time.time() - start_time) * 1000, 1)
-        logger.error(f"❌ Unexpected error fetching from {site}: {e}")
-        with metrics_lock:
-            metrics["errors"] += 1
-            prov_m = metrics["providers"].setdefault(site, {})
-            prov_m["total_calls"] = prov_m.get("total_calls", 0) + 1
-            prov_m["failed_calls"] = prov_m.get("failed_calls", 0) + 1
-            prov_m["status"] = "error"
-            prov_m["last_checked"] = datetime.now(UTC).strftime("%H:%M:%S UTC")
-        return []
+
+    def fetch_provider_streams() -> List[Dict[str, Any]]:
+        if is_provider_circuit_open(site):
+            return []
+
+        logger.info(f"🔍 Fetching streams from: {url}")
+        start_time = time.time()
+
+        try:
+            resp = session.get(url, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            elapsed_ms = round((time.time() - start_time) * 1000, 1)
+
+            record_provider_success(site)
+            with metrics_lock:
+                prov_m = metrics["providers"].setdefault(site, {})
+                prov_m["total_calls"] = prov_m.get("total_calls", 0) + 1
+                prov_m["last_response_time_ms"] = elapsed_ms
+                prov_m["last_status_code"] = resp.status_code
+                prov_m["status"] = "online"
+                prov_m["last_checked"] = datetime.now(UTC).strftime("%H:%M:%S UTC")
+
+            data = resp.json()
+            logger.info(f"📦 Streams fetched successfully from {site} ({elapsed_ms}ms)")
+            results: List[Dict[str, Any]] = []
+            if isinstance(data, dict):
+                raw_streams = data.get("streams", [])
+                if isinstance(raw_streams, list):
+                    results = [s for s in raw_streams if isinstance(s, dict) and s.get("infoHash")]
+            else:
+                logger.warning(f"⚠️ Warning: Expected dict from {site} but got {type(data)}")
+
+            with cache_lock:
+                if results:
+                    stream_cache[cache_key] = results
+                else:
+                    negative_stream_cache[cache_key] = []
+
+            return results
+
+        except requests.RequestException as e:
+            return _handle_provider_failure(site, start_time, cache_key, f"❌ Network error fetching from {site}: {e}")
+        except Exception as e:
+            return _handle_provider_failure(site, start_time, cache_key, f"❌ Unexpected error fetching from {site}: {e}")
+
+    return _run_singleflight(
+        flight_key=("stream", cache_key),
+        cache_lookup_fn=lambda: _lookup_stream_cache(cache_key),
+        fetch_fn=fetch_provider_streams,
+        default_value=[],
+    )
 
 
 def deduplicate_streams(streams: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -310,7 +561,7 @@ def deduplicate_streams(streams: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         norm_hash = info_hash.lower()
         title = stream.get("title") or stream.get("description") or stream.get("name") or ""
-        peer_match = re.search(r'[👤👥]\s*(\d+)', title) or re.search(r'(\d+)\s*seeders', title, re.IGNORECASE)
+        peer_match = PEER_EMOJI_RE.search(title) or PEER_TEXT_RE.search(title)
         seeders = int(peer_match.group(1)) if peer_match else 0
 
         if norm_hash not in best_streams or seeders > best_streams[norm_hash][0]:
@@ -319,25 +570,51 @@ def deduplicate_streams(streams: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [item[1] for item in best_streams.values()]
 
 
-def fetch_all_streams(sites: List[str], imdb_id: str, season: Optional[str] = None, episode: Optional[str] = None, content_type: str = "movie") -> List[Dict[str, Any]]:
-    """Fetches streams from multiple providers concurrently using ThreadPoolExecutor."""
+def fetch_all_streams(
+    sites: List[str],
+    imdb_id: str,
+    season: Optional[str] = None,
+    episode: Optional[str] = None,
+    content_type: str = "movie",
+    timeout: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Fetches streams from multiple providers concurrently without blocking on hung providers."""
+    if not sites:
+        return []
+
+    effective_timeout = FETCH_ALL_TIMEOUT if timeout is None else timeout
     all_streams: List[Dict[str, Any]] = []
 
-    with ThreadPoolExecutor(max_workers=max(1, len(sites))) as executor:
-        future_to_site = {
-            executor.submit(get_streams, site, imdb_id, season=season, episode=episode, content_type=content_type): site
-            for site in sites
-        }
+    future_to_site = {
+        STREAM_EXECUTOR.submit(
+            get_streams,
+            site,
+            imdb_id,
+            season=season,
+            episode=episode,
+            content_type=content_type,
+        ): site
+        for site in sites
+    }
+
+    done, not_done = futures_wait(future_to_site.keys(), timeout=effective_timeout)
+
+    for future in done:
+        site = future_to_site[future]
         try:
-            for future in as_completed(future_to_site, timeout=12):
-                site = future_to_site[future]
-                try:
-                    streams = future.result()
-                    all_streams.extend(streams)
-                except Exception as e:
-                    logger.error(f"❌ Unexpected error retrieving streams for {site}: {e}")
-        except TimeoutError:
-            logger.warning("⚠️ Overall provider fetch timed out; returning collected streams.")
+            all_streams.extend(future.result())
+        except Exception as e:
+            logger.error(f"❌ Unexpected error retrieving streams for {site}: {e}")
+
+    if not_done:
+        timed_out_sites = []
+        for future in not_done:
+            future.cancel()
+            timed_out_sites.append(future_to_site[future])
+        logger.warning(
+            f"⚠️ Provider fetch budget ({effective_timeout:.2f}s) reached; returning collected streams. "
+            f"Slow/timed-out providers: {', '.join(sorted(timed_out_sites))}"
+        )
 
     return deduplicate_streams(all_streams)
 
@@ -347,13 +624,13 @@ def clean_title_emojis(text: str) -> str:
     if not text:
         return ""
     # Replace newlines and tabs with spaces
-    t = re.sub(r'[\r\n\t]+', ' ', text)
+    t = WHITESPACE_CTRL_RE.sub(' ', text)
     # Remove seeders emoji and number, including :leechers (e.g. 👤 50, 👥 78 seeders, 👤100:60)
-    t = re.sub(r'[👤👥]\s*\d*(?::\d+)?(?:\s*seeders)?', '', t, flags=re.IGNORECASE)
+    t = SEEDERS_CLEAN_RE.sub('', t)
     # Remove emojis and symbols, keeping standard Latin alphanumeric, punctuation, 💾, and ◈
-    t = re.sub(r'[^\x00-\x7F\u00A0-\u024F\u1E00-\u1EFF💾◈]+', ' ', t)
+    t = NON_LATIN_EMOJI_RE.sub(' ', t)
     # Collapse multiple spaces and trim
-    return re.sub(r'\s+', ' ', t).strip()
+    return MULTI_SPACE_RE.sub(' ', t).strip()
 
 
 def build_rss_response(items: List[Dict[str, Any]], category_id: str = "2000", imdb_id: Optional[str] = None, media_title: Optional[str] = None) -> bytes:
@@ -372,8 +649,8 @@ def build_rss_response(items: List[Dict[str, Any]], category_id: str = "2000", i
             continue
 
         # 🔍 Extract size and peers from title before cleaning (supports 💾 and ◈)
-        size_match = re.search(r'[💾◈]\s*([\d.]+)\s*(GB|MB|GiB|MiB)', raw_title, re.IGNORECASE)
-        peer_match = re.search(r'[👤👥]\s*(\d+)', raw_title) or re.search(r'(\d+)\s*seeders', raw_title, re.IGNORECASE)
+        size_match = SIZE_RE.search(raw_title)
+        peer_match = PEER_EMOJI_RE.search(raw_title) or PEER_TEXT_RE.search(raw_title)
 
         # 🧮 Convert size to bytes
         if size_match:
@@ -452,6 +729,10 @@ def dashboard() -> Response:
     with cache_lock:
         omdb_cached_count = len(omdb_cache)
         stream_cached_count = len(stream_cache)
+        neg_cached_count = len(negative_stream_cache)
+
+    disabled_providers = parse_disabled_providers()
+    active_provider_count = len(get_active_sites("all"))
 
     provider_rows = []
     for name in sorted(PROVIDERS.keys()):
@@ -463,7 +744,22 @@ def dashboard() -> Response:
         last_chk = st.get("last_checked") or "-"
         is_custom = st.get("is_custom", False)
 
-        badge_class = "badge-online" if status == "online" else ("badge-error" if status == "error" else "badge-idle")
+        if name in disabled_providers:
+            status_display = "DISABLED"
+            badge_class = "badge-disabled"
+        elif status == "online":
+            status_display = "ONLINE"
+            badge_class = "badge-online"
+        elif status == "cooldown":
+            status_display = "COOLDOWN"
+            badge_class = "badge-cooldown"
+        elif status == "error":
+            status_display = "ERROR"
+            badge_class = "badge-error"
+        else:
+            status_display = status.upper()
+            badge_class = "badge-idle"
+
         type_badge = '<span class="badge badge-custom">Custom</span>' if is_custom else '<span class="badge badge-default">Built-in</span>'
         base_addon_url = PROVIDERS[name] if PROVIDERS[name].endswith('/') else f"{PROVIDERS[name]}/"
         direct_addon_url = f"{base_addon_url}movie/tt0133093.json"
@@ -477,7 +773,7 @@ def dashboard() -> Response:
                 <a href="/{name}/api?t=movie&imdbid=tt0133093" target="_blank" title="Test Internal Search (The Matrix)" style="text-decoration: none; margin-right: 8px; font-size: 1.1em;">🔍</a>
                 <a href="{direct_addon_url}" target="_blank" title="Direct Addon Streams (The Matrix)" style="text-decoration: none; font-size: 1.1em;">🔗</a>
             </td>
-            <td><span class="badge {badge_class}">{status.upper()}</span></td>
+            <td><span class="badge {badge_class}">{status_display}</span></td>
             <td>{latency}</td>
             <td>{calls} ({failed} err)</td>
             <td class="text-muted">{last_chk}</td>
@@ -570,8 +866,10 @@ def dashboard() -> Response:
             font-weight: 600;
         }}
         .badge-online {{ background: rgba(34, 197, 94, 0.15); color: var(--success); }}
+        .badge-cooldown {{ background: rgba(245, 158, 11, 0.15); color: var(--warning); }}
         .badge-error {{ background: rgba(239, 68, 68, 0.15); color: var(--danger); }}
         .badge-idle {{ background: rgba(148, 163, 184, 0.15); color: var(--text-muted); }}
+        .badge-disabled {{ background: rgba(100, 116, 139, 0.18); color: var(--text-muted); }}
         .badge-custom {{ background: rgba(168, 85, 247, 0.15); color: var(--custom); }}
         .badge-default {{ background: rgba(56, 189, 248, 0.15); color: var(--accent); }}
         code {{
@@ -632,13 +930,13 @@ def dashboard() -> Response:
             </div>
             <div class="card">
                 <div class="title">Active Providers</div>
-                <div class="value">{len(PROVIDERS)}</div>
-                <div class="subtitle">Configured addons</div>
+                <div class="value">{active_provider_count}</div>
+                <div class="subtitle">of {len(PROVIDERS)} configured addons</div>
             </div>
             <div class="card">
                 <div class="title">Memory Cache</div>
-                <div class="value">{omdb_cached_count + stream_cached_count}</div>
-                <div class="subtitle">OMDb: {omdb_cached_count} | Streams: {stream_cached_count}</div>
+                <div class="value">{omdb_cached_count + stream_cached_count + neg_cached_count}</div>
+                <div class="subtitle">Meta: {omdb_cached_count} | Streams: {stream_cached_count} | Neg: {neg_cached_count}</div>
             </div>
         </div>
 
@@ -669,7 +967,7 @@ def dashboard() -> Response:
                 <li><strong>Aggregated Torznab URL:</strong> <code>http://&lt;host&gt;:5100/api</code> (queries all active providers concurrently)</li>
                 <li><strong>Individual Provider URL:</strong> <code>http://&lt;host&gt;:5100/&lt;provider&gt;/api</code> (e.g., <code>/torrentio/api</code>, <code>/peerflix/api</code>)</li>
                 <li><strong>Categories:</strong> Movies: <code>2000, 2010</code> | TV: <code>5000, 5030, 5040</code></li>
-                <li><strong>OMDb Status:</strong> {'<span class="badge badge-online">API Key Configured</span>' if OMDB_API_KEY else '<span class="badge badge-error">API Key Missing</span>'}</li>
+                <li><strong>Metadata Status:</strong> {'<span class="badge badge-online">Cinemeta + OMDb Ready</span>' if OMDB_API_KEY else '<span class="badge badge-online">Cinemeta Ready</span> <span class="badge badge-idle">OMDb Key Missing</span>'}</li>
             </ul>
         </div>
     </div>
@@ -679,8 +977,64 @@ def dashboard() -> Response:
 
 
 # ---------------------------------------------------------
-# Torznab API Routing
+# Torznab API Routing & Helpers
 # ---------------------------------------------------------
+
+def normalize_imdb_id(raw_id: Optional[str]) -> Optional[str]:
+    cleaned = (raw_id or "").strip()
+    if not cleaned:
+        return None
+    return cleaned if cleaned.startswith("tt") else f"tt{cleaned}"
+
+
+def format_media_title(
+    meta_data: Optional[Dict[str, Any]],
+    content_type: str,
+    ep_tag: Optional[str] = None,
+) -> Optional[str]:
+    if not meta_data or not meta_data.get("Title"):
+        return None
+    t_name = str(meta_data["Title"]).strip()
+    if content_type == "series":
+        return f"{t_name} {ep_tag}" if ep_tag else t_name
+    t_year = str(meta_data.get("Year") or "").strip()
+    return f"{t_name} ({t_year})" if t_year else t_name
+
+
+def fetch_streams_with_parallel_metadata(
+    target_sites: List[str],
+    imdb_id: str,
+    content_type: str,
+    season: Optional[str] = None,
+    episode: Optional[str] = None,
+    ep_tag: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Resolves media title via Cinemeta/OMDb concurrently while fetching addon streams."""
+    meta_future = STREAM_EXECUTOR.submit(resolve_metadata_by_imdb, imdb_id, content_type)
+    all_streams = fetch_all_streams(
+        target_sites,
+        imdb_id,
+        season=season,
+        episode=episode,
+        content_type=content_type,
+    )
+
+    media_title: Optional[str] = None
+    if not meta_future.done():
+        futures_wait([meta_future], timeout=METADATA_WAIT_TIMEOUT)
+
+    if meta_future.done():
+        try:
+            meta_data = meta_future.result()
+            media_title = format_media_title(meta_data, content_type, ep_tag=ep_tag)
+        except Exception as e:
+            logger.debug(f"⚠️ Parallel metadata lookup failed for {imdb_id}: {e}")
+    else:
+        meta_future.cancel()
+        logger.debug(f"⚠️ Metadata lookup timed out after {METADATA_WAIT_TIMEOUT}s for {imdb_id}")
+
+    return all_streams, media_title
+
 
 @app.route("/api", defaults={"provider": None, "subpath": None}, strict_slashes=False)
 @app.route("/api/<path:subpath>", defaults={"provider": None}, strict_slashes=False)
@@ -692,9 +1046,7 @@ def torznab_api(provider: Optional[str] = None, subpath: Optional[str] = None) -
     if not provider or provider.lower() in ["api", "all"]:
         provider = "all"
     else:
-        provider = provider.lower()
-        if provider == "hydra-torrents":
-            provider = "hydra"
+        provider = canonicalize_provider_name(provider)
 
     if provider != "all" and provider not in PROVIDERS:
         return Response("<error>Unknown provider</error>", status=404, mimetype="application/xml")
@@ -704,7 +1056,7 @@ def torznab_api(provider: Optional[str] = None, subpath: Optional[str] = None) -
         if any(s.lower() != "api" for s in subpath_segments):
             return Response("<error>Invalid endpoint</error>", status=404, mimetype="application/xml")
 
-    target_sites = [provider] if provider != "all" else list(PROVIDERS.keys())
+    target_sites = get_active_sites(provider)
 
     args = request.args
     t = args.get("t")
@@ -719,8 +1071,7 @@ def torznab_api(provider: Optional[str] = None, subpath: Optional[str] = None) -
 
     elif t in ["search", "movie-search", "movie"]:
         query = (args.get("q") or "").strip()
-        imdb_id = (args.get("id") or args.get("imdbid") or "").strip()
-        imdb_id = "tt" + imdb_id if imdb_id and not imdb_id.startswith("tt") else (imdb_id or None)
+        imdb_id = normalize_imdb_id(args.get("id") or args.get("imdbid"))
         cat = args.get("cat", "2000").split(",")[0]
         media_title: Optional[str] = None
 
@@ -750,7 +1101,7 @@ def torznab_api(provider: Optional[str] = None, subpath: Optional[str] = None) -
             return Response(xml, mimetype="application/rss+xml")
 
         if not imdb_id and query:
-            match = re.match(r"^(.*?)(?:\s+(\d{4}))?$", query)
+            match = QUERY_YEAR_RE.match(query)
             if match:
                 title = match.group(1).strip()
                 year = match.group(2) if match.group(2) else ""
@@ -767,18 +1118,16 @@ def torznab_api(provider: Optional[str] = None, subpath: Optional[str] = None) -
                 logger.info(f"🎬 Found imdbID via OMDb: {imdb_id} ({media_title})")
             else:
                 media_title = query
-        elif imdb_id:
-            if query:
-                media_title = query
-            else:
-                omdb_data = get_omdb_metadata(imdb_id=imdb_id, content_type="movie")
-                if omdb_data and omdb_data.get("Title"):
-                    t_name = omdb_data.get("Title")
-                    t_year = omdb_data.get("Year")
-                    media_title = f"{t_name} ({t_year})" if t_year else t_name
+        elif imdb_id and query:
+            media_title = query
 
         if imdb_id:
-            all_streams = fetch_all_streams(target_sites, imdb_id, content_type="movie")
+            if not media_title:
+                all_streams, media_title = fetch_streams_with_parallel_metadata(
+                    target_sites, imdb_id, content_type="movie"
+                )
+            else:
+                all_streams = fetch_all_streams(target_sites, imdb_id, content_type="movie")
             xml = build_rss_response(all_streams, category_id=cat, imdb_id=imdb_id, media_title=media_title)
             return Response(xml, mimetype="application/rss+xml")
         else:
@@ -791,8 +1140,7 @@ def torznab_api(provider: Optional[str] = None, subpath: Optional[str] = None) -
         season = args.get("season", "1")
         episode = args.get("ep", "1")
         cat = args.get("cat", "5000").split(",")[0]
-        imdb_id = (args.get("id") or args.get("imdbid") or "").strip()
-        imdb_id = "tt" + imdb_id if imdb_id and not imdb_id.startswith("tt") else (imdb_id or None)
+        imdb_id = normalize_imdb_id(args.get("id") or args.get("imdbid"))
         media_title = None
 
         try:
@@ -826,16 +1174,16 @@ def torznab_api(provider: Optional[str] = None, subpath: Optional[str] = None) -
                 logger.info(f"🎬 Found series imdbID via OMDb: {imdb_id} ({media_title})")
             else:
                 media_title = f"{query} {ep_tag}"
-        elif imdb_id:
-            if query:
-                media_title = f"{query} {ep_tag}"
-            else:
-                omdb_data = get_omdb_metadata(imdb_id=imdb_id, content_type="series")
-                if omdb_data and omdb_data.get("Title"):
-                    media_title = f"{omdb_data.get('Title')} {ep_tag}"
+        elif imdb_id and query:
+            media_title = f"{query} {ep_tag}"
 
         if imdb_id:
-            all_streams = fetch_all_streams(target_sites, imdb_id, season=season, episode=episode, content_type="series")
+            if not media_title:
+                all_streams, media_title = fetch_streams_with_parallel_metadata(
+                    target_sites, imdb_id, content_type="series", season=season, episode=episode, ep_tag=ep_tag
+                )
+            else:
+                all_streams = fetch_all_streams(target_sites, imdb_id, season=season, episode=episode, content_type="series")
             xml = build_rss_response(all_streams, category_id=cat, imdb_id=imdb_id, media_title=media_title)
             return Response(xml, mimetype="application/rss+xml")
         else:

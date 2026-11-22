@@ -22,10 +22,13 @@ By running this proxy, you can use Stremio's vast ecosystem of torrent streaming
   - ☄️ Meteor
   - 🐉 Hydra Torrents (Multi-tracker & Spanish releases)
   - 🏴‍☠️ The Pirate Bay Plus (TPB+)
-- **Dynamic Custom Addons**: Easily connect additional Stremio addons at runtime via `CUSTOM_ADDONS`.
-- **In-Memory Caching (`cachetools`)**:
-  - 24-hour TTL cache for OMDb lookups to conserve API quota.
-  - 15-minute TTL cache for provider streams to speed up indexer queries.
+- **Dynamic Custom Addons**: Easily connect additional Stremio addons at runtime via `CUSTOM_ADDONS`, or exclude slow providers from `/api` aggregation via `DISABLED_PROVIDERS`.
+- **Fast Parallel Metadata & Caching (`cachetools`)**:
+  - **Cinemeta Primary + OMDb Fallback**: Resolves IMDb IDs to titles concurrently with stream fetching via Stremio's Cinemeta CDN (no API key required for IMDb searches), falling back to OMDb when needed.
+  - **Shared In-Memory Cache + Request Coalescing**: 24-hour TTL for metadata, 15-minute TTL for streams, short 60s negative cache for empty/failed responses, and singleflight request coalescing to prevent duplicate concurrent upstream calls.
+- **Resilient & Low-Latency Fetching**:
+  - Non-blocking provider aggregation capped by `FETCH_ALL_TIMEOUT` (default `5.5s`) with fail-fast HTTP timeouts (`CONNECT_TIMEOUT=2.0s`, `READ_TIMEOUT=4.0s`) and zero timeout retries.
+  - **Per-Provider Circuit Breaker**: Automatically puts failing/timed-out providers into temporary cooldown (`CB_FAILURE_THRESHOLD=3`, `CB_COOLDOWN_SECONDS=180`) so broken addons are skipped in `0 ms`.
 - **Smart Parsing & Title Prepending**:
   - Automatically prepends official movie/series titles to addon streams (e.g., `Inception (2010) - [RD+] 1080p - 2GB`) to ensure Radarr/Sonarr parses quality without rejecting vague titles.
   - Accurately parses sizes (`💾`) and seeders (`👤`) into standard Torznab attributes.
@@ -49,8 +52,14 @@ services:
     container_name: stremioarrs
     environment:
       - OMDB_API_KEY=your_omdb_api_key_here
-      # Optional custom addons:
+      # Optional custom addons & performance tuning:
       # - CUSTOM_ADDONS=myaddon=https://myaddon.strem.fun/stream/,addon2=https://addon2.com/stream/
+      # - DISABLED_PROVIDERS=meteor,thepiratebay-plus
+      # - FETCH_ALL_TIMEOUT=5.5
+      # - CONNECT_TIMEOUT=2.0
+      # - READ_TIMEOUT=4.0
+      # - CB_FAILURE_THRESHOLD=3
+      # - CB_COOLDOWN_SECONDS=180
     ports:
       - "5100:5100"
     restart: unless-stopped
